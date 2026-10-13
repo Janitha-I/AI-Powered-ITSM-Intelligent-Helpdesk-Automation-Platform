@@ -1,447 +1,795 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
-import random
-import warnings
-from collections.abc import Generator, Sequence
-from typing import Any
+import socket
+import ssl as ssl_module
+import traceback
+import urllib.parse
+from collections.abc import AsyncIterator, Generator, Sequence
+from types import TracebackType
+from typing import Any, Callable, Literal, cast
 
-from .datastructures import Headers, MultipleValuesError
-from .exceptions import (
-    InvalidHandshake,
-    InvalidHeader,
-    InvalidHeaderValue,
-    InvalidMessage,
+from ..client import ClientProtocol, backoff, process_exception
+from ..datastructures import Headers, HeadersLike
+from ..exceptions import (
+    InvalidProxyMessage,
+    InvalidProxyStatus,
     InvalidStatus,
-    InvalidUpgrade,
-    NegotiationError,
-    StatusLineTooLong,
+    ProxyError,
+    SecurityError,
 )
-from .extensions import ClientExtensionFactory, Extension
-from .headers import (
-    build_authorization_basic,
-    build_extension,
-    build_host,
-    build_subprotocol,
-    parse_connection,
-    parse_extension,
-    parse_subprotocol,
-    parse_upgrade,
-)
-from .http11 import Request, Response
-from .imports import lazy_import
-from .protocol import CLIENT, CONNECTING, OPEN, Protocol, State
-from .typing import (
-    ConnectionOption,
-    ExtensionHeader,
-    LoggerLike,
-    Origin,
-    Subprotocol,
-    UpgradeProtocol,
-)
-from .uri import WebSocketURI
-from .utils import accept_key, generate_key
+from ..extensions.base import ClientExtensionFactory
+from ..extensions.permessage_deflate import enable_client_permessage_deflate
+from ..headers import validate_subprotocols
+from ..http11 import USER_AGENT, Response
+from ..protocol import CONNECTING, Event
+from ..proxy import Proxy, get_proxy, parse_proxy, prepare_connect_request
+from ..streams import StreamReader
+from ..typing import LoggerLike, Origin, PathLike, Subprotocol
+from ..uri import WebSocketURI, parse_uri
+from .connection import Connection
 
 
-__all__ = ["ClientProtocol"]
+__all__ = ["connect", "unix_connect", "ClientConnection"]
+
+MAX_REDIRECTS = int(os.environ.get("WEBSOCKETS_MAX_REDIRECTS", "10"))
 
 
-class ClientProtocol(Protocol):
+class ClientConnection(Connection):
     """
-    Sans-I/O implementation of a WebSocket client connection.
+    :mod:`asyncio` implementation of a WebSocket client connection.
+
+    :class:`ClientConnection` provides :meth:`recv` and :meth:`send` coroutines
+    for receiving and sending messages.
+
+    It supports asynchronous iteration to receive messages::
+
+        async for message in websocket:
+            await process(message)
+
+    The iterator exits normally when the connection is closed with code
+    1000 (OK) or 1001 (going away) or without a close code. It raises a
+    :exc:`~websockets.exceptions.ConnectionClosedError` when the connection is
+    closed with any other code.
+
+    The ``ping_interval``, ``ping_timeout``, ``close_timeout``, ``max_queue``,
+    and ``write_limit`` arguments have the same meaning as in :func:`connect`.
 
     Args:
-        uri: URI of the WebSocket server, parsed
-            with :func:`~websockets.uri.parse_uri`.
-        origin: Value of the ``Origin`` header. This is useful when connecting
-            to a server that validates the ``Origin`` header to defend against
-            Cross-Site WebSocket Hijacking attacks.
-        extensions: List of supported extensions, in order in which they
-            should be tried.
-        subprotocols: List of supported subprotocols, in order of decreasing
-            preference.
-        state: Initial state of the WebSocket connection.
-        max_size: Maximum size of incoming messages in bytes.
-            :obj:`None` disables the limit. You may pass a ``(max_message_size,
-            max_fragment_size)`` tuple to set different limits for messages and
-            fragments when you expect long messages sent in short fragments.
-        logger: Logger for this connection;
-            defaults to ``logging.getLogger("websockets.client")``;
-            see the :doc:`logging guide <../../topics/logging>` for details.
+        protocol: Sans-I/O connection.
 
     """
 
     def __init__(
         self,
-        uri: WebSocketURI,
+        protocol: ClientProtocol,
         *,
+        ping_interval: float | None = 20,
+        ping_timeout: float | None = 20,
+        close_timeout: float | None = 10,
+        max_queue: int | None | tuple[int | None, int | None] = 16,
+        write_limit: int | tuple[int, int | None] = 2**15,
+    ) -> None:
+        self.protocol: ClientProtocol
+        super().__init__(
+            protocol,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            close_timeout=close_timeout,
+            max_queue=max_queue,
+            write_limit=write_limit,
+        )
+        self.response_rcvd: asyncio.Future[None] = self.loop.create_future()
+
+    async def handshake(
+        self,
+        additional_headers: HeadersLike | None = None,
+        user_agent_header: str | None = USER_AGENT,
+    ) -> None:
+        """
+        Perform the opening handshake.
+
+        """
+        self.request = self.protocol.connect()
+        if additional_headers is not None:
+            self.request.headers.update(additional_headers)
+        if user_agent_header is not None:
+            self.request.headers.setdefault("User-Agent", user_agent_header)
+        async with self.send_context(expected_state=CONNECTING):
+            self.protocol.send_request(self.request)
+
+        await asyncio.wait(
+            [self.response_rcvd, self.connection_lost_waiter],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # self.protocol.handshake_exc is set when the connection is lost before
+        # receiving a response, when the response cannot be parsed, or when the
+        # response fails the handshake.
+
+        if self.protocol.handshake_exc is not None:
+            raise self.protocol.handshake_exc
+
+    def process_event(self, event: Event) -> None:
+        """
+        Process one incoming event.
+
+        """
+        # First event - handshake response.
+        if self.response is None:
+            assert isinstance(event, Response)
+            self.response = event
+            self.response_rcvd.set_result(None)
+        # Later events - frames.
+        else:
+            super().process_event(event)
+
+
+# This is spelled in lower case because it's exposed as a callable in the API.
+class connect:
+    """
+    Connect to the WebSocket server at ``uri``.
+
+    :func:`connect` should be treated as an asynchronous context manager
+    yielding a :class:`ClientConnection`, which can then receive and send
+    messages::
+
+        from websockets.asyncio.client import connect
+
+        async with connect(...) as websocket:
+            ...
+
+    The connection is closed automatically when exiting the context.
+
+    :func:`connect` can also be treated as an infinite asynchronous iterator
+    to reconnect automatically on errors::
+
+        async for websocket in connect(...):
+            try:
+                ...
+            except websockets.exceptions.ConnectionClosed:
+                continue
+
+    If the connection fails with a transient error, it is retried with
+    exponential backoff. If it fails with a fatal error, the exception is
+    raised, breaking out of the loop.
+
+    The connection is closed automatically after each iteration of the loop.
+
+    :func:`connect` can be awaited directly::
+
+        websocket = await connect(...)
+
+    In that case, you're responsible for closing the connection with
+    :meth:`ClientConnection.close` when no longer needed.
+
+    Args:
+        uri: URI of the WebSocket server.
+        origin: Value of the ``Origin`` header, for servers that require it.
+        extensions: List of supported extensions, in order in which they
+            should be negotiated and run.
+        subprotocols: List of supported subprotocols, in order of decreasing
+            preference.
+        compression: The "permessage-deflate" extension is enabled by default.
+            Set ``compression`` to :obj:`None` to disable it. See the
+            :doc:`compression guide <../../topics/compression>` for details.
+        additional_headers: Arbitrary HTTP headers to add to the handshake
+            request.
+        user_agent_header: Value of  the ``User-Agent`` request header.
+            It defaults to ``"Python/x.y.z websockets/X.Y"``.
+            Setting it to :obj:`None` removes the header.
+        proxy: If a proxy is configured, it is used by default. Set ``proxy``
+            to :obj:`None` to disable the proxy or to the address of a proxy
+            to override the system configuration. See the :doc:`proxy docs
+            <../../topics/proxies>` for details.
+        process_exception: When reconnecting automatically, tell whether an
+            error is transient or fatal. The default behavior is defined by
+            :func:`~websockets.client.process_exception`. Refer to its
+            documentation for details.
+        open_timeout: Timeout for opening the connection in seconds.
+            :obj:`None` disables the timeout.
+        ping_interval: Interval between keepalive pings in seconds.
+            :obj:`None` disables keepalive.
+        ping_timeout: Timeout for keepalive pings in seconds.
+            :obj:`None` disables timeouts.
+        close_timeout: Timeout for closing the connection in seconds.
+            :obj:`None` disables the timeout.
+        reconnect_delays: Delays in seconds between reconnection attempts.
+            Default is exponential backoff with 5s jitter, capped at 60s.
+        max_size: Maximum size of incoming messages in bytes.
+            :obj:`None` disables the limit. You may pass a ``(max_message_size,
+            max_fragment_size)`` tuple to set different limits for messages and
+            fragments when you expect long messages sent in short fragments.
+        max_queue: High-water mark of the buffer where frames are received.
+            It defaults to 16 frames. The low-water mark defaults to ``max_queue
+            // 4``. You may pass a ``(high, low)`` tuple to set the high-water
+            and low-water marks. If you want to disable flow control entirely,
+            you may set it to ``None``, although that's a bad idea.
+        write_limit: High-water mark of write buffer in bytes. It is passed to
+            :meth:`~asyncio.WriteTransport.set_write_buffer_limits`. It defaults
+            to 32 KiB. You may pass a ``(high, low)`` tuple to set the
+            high-water and low-water marks.
+        logger: Logger for this client.
+            It defaults to ``logging.getLogger("websockets.client")``.
+            See the :doc:`logging guide <../../topics/logging>` for details.
+        create_connection: Factory for the :class:`ClientConnection` managing
+            the connection. Set it to a wrapper or a subclass to customize
+            connection handling.
+
+    Any other keyword arguments are passed to the event loop's
+    :meth:`~asyncio.loop.create_connection` method.
+
+    For example:
+
+    * You can set ``sock`` to provide a preexisting TCP socket. You may call
+      :func:`socket.create_connection` (not to be confused with the event loop's
+      :meth:`~asyncio.loop.create_connection` method) to create a suitable
+      client socket and customize it.
+
+    * You can set ``ssl`` to a :class:`~ssl.SSLContext` to enforce TLS settings.
+      When connecting to a ``wss://`` URI, if ``ssl`` isn't provided, a TLS
+      context is created with :func:`~ssl.create_default_context`.
+
+    * You can set ``server_hostname`` to override the host name from ``uri`` in
+      the TLS handshake.
+
+    * You can configure ``ssl_handshake_timeout`` and ``ssl_shutdown_timeout``.
+
+    * You can set ``host`` and ``port`` to connect to a different host and port
+      from those found in ``uri``. This only changes the destination of the TCP
+      connection. The host name from ``uri`` is still used in the TLS handshake
+      for secure connections and in the ``Host`` header.
+
+    When using a proxy:
+
+    * Prefix keyword arguments with ``proxy_`` for configuring TLS between the
+      client and an HTTPS proxy: ``proxy_ssl``, ``proxy_server_hostname``,
+      ``proxy_ssl_handshake_timeout``, and ``proxy_ssl_shutdown_timeout``.
+    * Use the standard keyword arguments for configuring TLS between the proxy
+      and the WebSocket server: ``ssl``, ``server_hostname``,
+      ``ssl_handshake_timeout``, and ``ssl_shutdown_timeout``.
+    * Other keyword arguments are used only for connecting to the proxy.
+
+    Raises:
+        InvalidURI: If ``uri`` isn't a valid WebSocket URI.
+        InvalidProxy: If ``proxy`` isn't a valid proxy.
+        OSError: If the TCP connection fails.
+        InvalidHandshake: If the opening handshake fails.
+        TimeoutError: If the opening handshake times out.
+
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        # WebSocket
         origin: Origin | None = None,
         extensions: Sequence[ClientExtensionFactory] | None = None,
         subprotocols: Sequence[Subprotocol] | None = None,
-        state: State = CONNECTING,
+        compression: str | None = "deflate",
+        # HTTP
+        additional_headers: HeadersLike | None = None,
+        user_agent_header: str | None = USER_AGENT,
+        proxy: str | Literal[True] | None = True,
+        process_exception: Callable[[Exception], Exception | None] = process_exception,
+        # Timeouts
+        open_timeout: float | None = 10,
+        ping_interval: float | None = 20,
+        ping_timeout: float | None = 20,
+        close_timeout: float | None = 10,
+        reconnect_delays: Callable[[], Generator[float]] = backoff,
+        # Limits
         max_size: int | None | tuple[int | None, int | None] = 2**20,
+        max_queue: int | None | tuple[int | None, int | None] = 16,
+        write_limit: int | tuple[int, int | None] = 2**15,
+        # Logging
         logger: LoggerLike | None = None,
+        # Escape hatches for advanced customization
+        create_connection: type[ClientConnection] | None = None,
+        # Other keyword arguments are passed to loop.create_connection
+        **kwargs: Any,
     ) -> None:
-        super().__init__(
-            side=CLIENT,
-            state=state,
-            max_size=max_size,
-            logger=logger,
-        )
         self.uri = uri
-        self.origin = origin
-        self.available_extensions = extensions
-        self.available_subprotocols = subprotocols
-        self.key = generate_key()
+        self.ws_uri = parse_uri(uri)
+        if not self.ws_uri.secure and kwargs.get("ssl") is not None:
+            raise ValueError("ssl argument is incompatible with a ws:// URI")
 
-    def connect(self) -> Request:
-        """
-        Create a handshake request to open a connection.
+        if subprotocols is not None:
+            validate_subprotocols(subprotocols)
 
-        You must send the handshake request with :meth:`send_request`.
+        if compression == "deflate":
+            extensions = enable_client_permessage_deflate(extensions)
+        elif compression is not None:
+            raise ValueError(f"unsupported compression: {compression}")
 
-        You can modify it before sending it, for example to add HTTP headers.
+        if logger is None:
+            logger = logging.getLogger("websockets.client")
 
-        Returns:
-            WebSocket handshake request event to send to the server.
+        if create_connection is None:
+            create_connection = ClientConnection
 
-        """
-        headers = Headers()
-        headers["Host"] = build_host(self.uri.host, self.uri.port, self.uri.secure)
-        if self.uri.user_info:
-            headers["Authorization"] = build_authorization_basic(*self.uri.user_info)
-        if self.origin is not None:
-            headers["Origin"] = self.origin
-        headers["Upgrade"] = "websocket"
-        headers["Connection"] = "Upgrade"
-        headers["Sec-WebSocket-Key"] = self.key
-        headers["Sec-WebSocket-Version"] = "13"
-        if self.available_extensions is not None:
-            headers["Sec-WebSocket-Extensions"] = build_extension(
-                [
-                    (extension_factory.name, extension_factory.get_request_params())
-                    for extension_factory in self.available_extensions
-                ]
+        self.additional_headers = additional_headers
+        self.user_agent_header = user_agent_header
+        self.proxy = proxy
+        self.process_exception = process_exception
+        self.open_timeout = open_timeout
+        self.reconnect_delays = reconnect_delays
+        self.logger = logger
+        self.create_connection_kwargs = kwargs
+
+        def factory(uri: WebSocketURI) -> ClientConnection:
+            # This is a protocol in the Sans-I/O implementation of websockets.
+            protocol = ClientProtocol(
+                uri,
+                origin=origin,
+                extensions=extensions,
+                subprotocols=subprotocols,
+                max_size=max_size,
+                logger=logger,
             )
-        if self.available_subprotocols is not None:
-            headers["Sec-WebSocket-Protocol"] = build_subprotocol(
-                self.available_subprotocols
+            # This is a connection in websockets and a protocol in asyncio.
+            # create_connection defaults to ClientConnection.
+            connection = create_connection(
+                protocol,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+                close_timeout=close_timeout,
+                max_queue=max_queue,
+                write_limit=write_limit,
             )
-        return Request(self.uri.resource_name, headers)
+            return connection
 
-    def process_response(self, response: Response) -> None:
-        """
-        Check a handshake response.
+        self.factory = factory
 
-        Args:
-            request: WebSocket handshake response received from the server.
+    async def open_tcp_connection(self) -> ClientConnection:
+        """Open a TCP or Unix connection to the server, possibly through a proxy."""
+        loop = asyncio.get_running_loop()
+        kwargs = self.create_connection_kwargs.copy()
 
-        Raises:
-            InvalidHandshake: If the handshake response is invalid.
+        proxy = self.proxy
+        if kwargs.get("unix", False):
+            proxy = None
+        if kwargs.get("sock") is not None:
+            proxy = None
+        if proxy is True:
+            proxy = get_proxy(self.ws_uri)
 
-        """
+        def factory() -> ClientConnection:
+            return self.factory(self.ws_uri)
 
-        if response.status_code != 101:
-            raise InvalidStatus(response)
+        if self.ws_uri.secure:
+            kwargs.setdefault("ssl", True)
+            if kwargs.get("ssl") is None:
+                raise ValueError("ssl=None is incompatible with a wss:// URI")
+            kwargs.setdefault("server_hostname", self.ws_uri.host)
 
-        headers = response.headers
+        if kwargs.pop("unix", False):
+            _, connection = await loop.create_unix_connection(factory, **kwargs)
+            return connection
 
-        connection: list[ConnectionOption] = sum(
-            [parse_connection(value) for value in headers.get_all("Connection")], []
-        )
-        if not any(value.lower() == "upgrade" for value in connection):
-            raise InvalidUpgrade(
-                "Connection", ", ".join(connection) if connection else None
-            )
+        if proxy is not None:
+            proxy_parsed = parse_proxy(proxy)
 
-        upgrade: list[UpgradeProtocol] = sum(
-            [parse_upgrade(value) for value in headers.get_all("Upgrade")], []
-        )
-        # For compatibility with non-strict implementations, ignore case when
-        # checking the Upgrade header. It's supposed to be 'WebSocket'.
-        if not (len(upgrade) == 1 and upgrade[0].lower() == "websocket"):
-            raise InvalidUpgrade("Upgrade", ", ".join(upgrade) if upgrade else None)
+            if proxy_parsed.scheme[:5] == "socks":
+                # Connect to the server through the SOCKS proxy.
+                sock = await connect_socks_proxy(
+                    proxy_parsed,
+                    self.ws_uri,
+                    # python_socks uses local_addr like asyncio.
+                    local_addr=kwargs.pop("local_addr", None),
+                )
+                # Initialize WebSocket connection via the proxy.
+                _, connection = await loop.create_connection(
+                    factory,
+                    sock=sock,
+                    **kwargs,
+                )
+                return connection
 
-        try:
-            s_w_accept = headers["Sec-WebSocket-Accept"]
-        except KeyError:
-            raise InvalidHeader("Sec-WebSocket-Accept") from None
-        except MultipleValuesError:
-            raise InvalidHeader("Sec-WebSocket-Accept", "multiple values") from None
-        if s_w_accept != accept_key(self.key):
-            raise InvalidHeaderValue("Sec-WebSocket-Accept", s_w_accept)
-
-        self.extensions = self.process_extensions(headers)
-        self.subprotocol = self.process_subprotocol(headers)
-
-    def process_extensions(self, headers: Headers) -> list[Extension]:
-        """
-        Handle the Sec-WebSocket-Extensions HTTP response header.
-
-        Check that each extension is supported, as well as its parameters.
-
-        :rfc:`6455` leaves the rules up to the specification of each
-        extension.
-
-        To provide this level of flexibility, for each extension accepted by
-        the server, we check for a match with each extension available in the
-        client configuration. If no match is found, an exception is raised.
-
-        If several variants of the same extension are accepted by the server,
-        it may be configured several times, which won't make sense in general.
-        Extensions must implement their own requirements. For this purpose,
-        the list of previously accepted extensions is provided.
-
-        Other requirements, for example related to mandatory extensions or the
-        order of extensions, may be implemented by overriding this method.
-
-        Args:
-            headers: WebSocket handshake response headers.
-
-        Returns:
-            List of accepted extensions.
-
-        Raises:
-            InvalidHandshake: To abort the handshake.
-
-        """
-        accepted_extensions: list[Extension] = []
-
-        extensions = headers.get_all("Sec-WebSocket-Extensions")
-
-        if extensions:
-            if self.available_extensions is None:
-                raise NegotiationError("no extensions supported")
-
-            parsed_extensions: list[ExtensionHeader] = sum(
-                [parse_extension(header_value) for header_value in extensions], []
-            )
-
-            for name, response_params in parsed_extensions:
-                for extension_factory in self.available_extensions:
-                    # Skip non-matching extensions based on their name.
-                    if extension_factory.name != name:
-                        continue
-
-                    # Skip non-matching extensions based on their params.
-                    try:
-                        extension = extension_factory.process_response_params(
-                            response_params, accepted_extensions
+            elif proxy_parsed.scheme[:4] == "http":
+                # Split keyword arguments between the proxy and the server.
+                all_kwargs, proxy_kwargs, kwargs = kwargs, {}, {}
+                for key, value in all_kwargs.items():
+                    if key.startswith("ssl") or key == "server_hostname":
+                        kwargs[key] = value
+                    elif key.startswith("proxy_"):
+                        proxy_kwargs[key[6:]] = value
+                    else:
+                        proxy_kwargs[key] = value
+                # Validate the proxy_ssl argument.
+                if proxy_parsed.scheme == "https":
+                    proxy_kwargs.setdefault("ssl", True)
+                    if proxy_kwargs.get("ssl") is None:
+                        raise ValueError(
+                            "proxy_ssl=None is incompatible with an https:// proxy"
                         )
-                    except NegotiationError:
-                        continue
-
-                    # Add matching extension to the final list.
-                    accepted_extensions.append(extension)
-
-                    # Break out of the loop once we have a match.
-                    break
-
-                # If we didn't break from the loop, no extension in our list
-                # matched what the server sent. Fail the connection.
                 else:
-                    raise NegotiationError(
-                        f"Unsupported extension: "
-                        f"name = {name}, params = {response_params}"
+                    if proxy_kwargs.get("ssl") is not None:
+                        raise ValueError(
+                            "proxy_ssl argument is incompatible with an http:// proxy"
+                        )
+                # Connect to the server through the HTTP proxy.
+                transport = await connect_http_proxy(
+                    proxy_parsed,
+                    self.ws_uri,
+                    user_agent_header=self.user_agent_header,
+                    **proxy_kwargs,
+                )
+                # Initialize WebSocket connection via the proxy.
+                connection = factory()
+                transport.set_protocol(connection)
+                ssl = kwargs.pop("ssl", None)
+                if ssl is True:
+                    ssl = ssl_module.create_default_context()
+                if ssl is not None:
+                    new_transport = await loop.start_tls(
+                        transport, connection, ssl, **kwargs
                     )
+                    assert new_transport is not None  # help mypy
+                    transport = new_transport
+                connection.connection_made(transport)
+                return connection
 
-        return accepted_extensions
+            else:
+                raise AssertionError("parse_proxy returned unsupported proxy")
 
-    def process_subprotocol(self, headers: Headers) -> Subprotocol | None:
+        else:  # proxy is None
+            # Connect to the server directly.
+            if kwargs.get("sock") is None:
+                kwargs.setdefault("host", self.ws_uri.host)
+                kwargs.setdefault("port", self.ws_uri.port)
+            # Initialize WebSocket connection.
+            _, connection = await loop.create_connection(factory, **kwargs)
+            return connection
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
         """
-        Handle the Sec-WebSocket-Protocol HTTP response header.
+        Determine whether a connection error is a redirect that can be followed.
 
-        If provided, check that it contains exactly one supported subprotocol.
-
-        Args:
-            headers: WebSocket handshake response headers.
-
-        Returns:
-           Subprotocol, if one was selected.
+        Return the new URI if it's a valid redirect. Else, return an exception.
 
         """
-        subprotocol: Subprotocol | None = None
+        if not (
+            isinstance(exc, InvalidStatus)
+            and exc.response.status_code
+            in [
+                300,  # Multiple Choices
+                301,  # Moved Permanently
+                302,  # Found
+                303,  # See Other
+                307,  # Temporary Redirect
+                308,  # Permanent Redirect
+            ]
+            and "Location" in exc.response.headers
+        ):
+            return exc
 
-        subprotocols = headers.get_all("Sec-WebSocket-Protocol")
+        old_ws_uri = self.ws_uri
+        new_uri = urllib.parse.urljoin(self.uri, exc.response.headers["Location"])
+        new_ws_uri = parse_uri(new_uri)
 
-        if subprotocols:
-            if self.available_subprotocols is None:
-                raise NegotiationError("no subprotocols supported")
-
-            parsed_subprotocols: Sequence[Subprotocol] = sum(
-                [parse_subprotocol(header_value) for header_value in subprotocols], []
+        # If connect() received a socket, it is closed and cannot be reused.
+        if self.create_connection_kwargs.get("sock") is not None:
+            return ValueError(
+                f"cannot follow redirect to {new_uri} with a preexisting socket"
             )
-            if len(parsed_subprotocols) > 1:
-                raise InvalidHeader(
-                    "Sec-WebSocket-Protocol",
-                    f"multiple values: {', '.join(parsed_subprotocols)}",
+
+        # TLS downgrade is forbidden.
+        if old_ws_uri.secure and not new_ws_uri.secure:
+            return SecurityError(f"cannot follow redirect to non-secure URI {new_uri}")
+
+        # Apply restrictions to cross-origin redirects.
+        if (
+            old_ws_uri.secure != new_ws_uri.secure
+            or old_ws_uri.host != new_ws_uri.host
+            or old_ws_uri.port != new_ws_uri.port
+        ):
+            # Cross-origin redirects on Unix sockets don't quite make sense.
+            if self.create_connection_kwargs.get("unix", False):
+                return ValueError(
+                    f"cannot follow cross-origin redirect to {new_uri} "
+                    f"with a Unix socket"
                 )
 
-            subprotocol = parsed_subprotocols[0]
-            if subprotocol not in self.available_subprotocols:
-                raise NegotiationError(f"unsupported subprotocol: {subprotocol}")
+            # Cross-origin redirects when host and port are overridden are ill-defined.
+            if (
+                self.create_connection_kwargs.get("host") is not None
+                or self.create_connection_kwargs.get("port") is not None
+            ):
+                return ValueError(
+                    f"cannot follow cross-origin redirect to {new_uri} "
+                    f"with an explicit host or port"
+                )
 
-        return subprotocol
+            # Strip credentials to avoid leaking them to a different origin.
+            if self.additional_headers is not None:
+                self.additional_headers = Headers(
+                    (
+                        (key, value)
+                        for key, value in Headers(self.additional_headers).raw_items()
+                        if key.lower()
+                        not in ["authorization", "cookie", "proxy-authorization"]
+                    )
+                )
 
-    def send_request(self, request: Request) -> None:
-        """
-        Send a handshake request to the server.
+        return new_uri
 
-        Args:
-            request: WebSocket handshake request event.
+    async def connect(self) -> ClientConnection:
+        try:
+            async with asyncio.timeout(self.open_timeout):
+                for _ in range(MAX_REDIRECTS):
+                    connection = await self.open_tcp_connection()
+                    try:
+                        await connection.handshake(
+                            self.additional_headers,
+                            self.user_agent_header,
+                        )
+                    except asyncio.CancelledError:
+                        connection.transport.abort()
+                        raise
+                    except Exception as exc:
+                        # Always close the connection even though keep-alive is
+                        # the default in HTTP/1.1 because create_connection ties
+                        # opening the network connection with initializing the
+                        # protocol. In the current design of connect(), there is
+                        # no easy way to reuse the network connection that works
+                        # in every case nor to reinitialize the protocol.
+                        connection.transport.abort()
 
-        """
-        if self.debug:
-            self.logger.debug("> GET %s HTTP/1.1", request.path)
-            for key, value in request.headers.raw_items():
-                self.logger.debug("> %s: %s", key, value)
+                        exc_or_uri = self.process_redirect(exc)
+                        if isinstance(exc_or_uri, Exception):
+                            # Response isn't a valid redirect; raise the exception.
+                            if exc_or_uri is exc:
+                                raise
+                            else:
+                                raise exc_or_uri from exc
+                        else:
+                            # Response is a valid redirect; follow it.
+                            self.uri = exc_or_uri
+                            self.ws_uri = parse_uri(exc_or_uri)
+                            continue
 
-        self.writes.append(request.serialize())
+                    else:
+                        connection.start_keepalive()
+                        return connection
+                else:
+                    raise SecurityError(f"more than {MAX_REDIRECTS} redirects")
 
-    def parse(self) -> Generator[None]:
-        if self.state is CONNECTING:
+        except TimeoutError as exc:
+            # Re-raise exception with an informative error message.
+            raise TimeoutError("timed out during opening handshake") from exc
+
+    # ... = await connect(...)
+
+    def __await__(self) -> Generator[Any, None, ClientConnection]:
+        # Create a suitable iterator by calling __await__ on a coroutine.
+        return self.connect().__await__()
+
+    # async with connect(...) as ...: ...
+
+    async def __aenter__(self) -> ClientConnection:
+        if hasattr(self, "connection"):
+            raise RuntimeError("connect() isn't reentrant")
+        self.connection = await self
+        return await self.connection.__aenter__()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            return await self.connection.__aexit__(exc_type, exc_value, traceback)
+        finally:
+            del self.connection
+
+    # async for ... in connect(...):
+
+    async def __aiter__(self) -> AsyncIterator[ClientConnection]:
+        delays: Generator[float] | None = None
+        while True:
             try:
-                response = yield from Response.parse(
-                    self.reader.read_line,
-                    self.reader.read_exact,
-                    self.reader.read_to_eof,
-                )
-            except StatusLineTooLong as exc:
-                self.handshake_exc = exc
-                self.send_eof()
-                self.parser = self.discard()
-                next(self.parser)  # start coroutine
-                yield
+                async with self as connection:
+                    yield connection
             except Exception as exc:
-                self.handshake_exc = InvalidMessage(
-                    "did not receive a valid HTTP response"
+                # Determine whether the exception is retryable or fatal.
+                # The API of process_exception is "return an exception or None";
+                # "raise an exception" is also supported because it's a frequent
+                # mistake. It isn't documented in order to keep the API simple.
+                try:
+                    new_exc = self.process_exception(exc)
+                except Exception as raised_exc:
+                    new_exc = raised_exc
+
+                # The connection failed with a fatal error.
+                # Raise the exception and exit the loop.
+                if new_exc is exc:
+                    raise
+                if new_exc is not None:
+                    raise new_exc from exc
+
+                # The connection failed with a retryable error.
+                # Start or continue backoff and reconnect.
+                if delays is None:
+                    delays = self.reconnect_delays()
+                delay = next(delays)
+                self.logger.info(
+                    "connect failed; reconnecting in %.1f seconds: %s",
+                    delay,
+                    traceback.format_exception_only(exc)[0].strip(),
                 )
-                self.handshake_exc.__cause__ = exc
-                self.send_eof()
-                self.parser = self.discard()
-                next(self.parser)  # start coroutine
-                yield
+                await asyncio.sleep(delay)
 
-            if self.debug:
-                code, phrase = response.status_code, response.reason_phrase
-                self.logger.debug("< HTTP/1.1 %d %s", code, phrase)
-                for key, value in response.headers.raw_items():
-                    self.logger.debug("< %s: %s", key, value)
-                if response.body:
-                    self.logger.debug("< [body] (%d bytes)", len(response.body))
-
-            try:
-                self.process_response(response)
-            except InvalidHandshake as exc:
-                response._exception = exc
-                self.events.append(response)
-                self.handshake_exc = exc
-                self.send_eof()
-                self.parser = self.discard()
-                next(self.parser)  # start coroutine
-                yield
-
-            assert self.state is CONNECTING
-            self.state = OPEN
-            self.events.append(response)
-
-        yield from super().parse()
+            else:
+                # The connection succeeded. Reset backoff.
+                delays = None
 
 
-class ClientConnection(ClientProtocol):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(  # deprecated in 11.0 - 2023-04-02
-            "ClientConnection was renamed to ClientProtocol",
-            DeprecationWarning,
+def unix_connect(
+    path: PathLike | None = None,
+    uri: str | None = None,
+    **kwargs: Any,
+) -> connect:
+    """
+    Connect to a WebSocket server listening on a Unix socket.
+
+    This function accepts the same keyword arguments as :func:`connect`.
+
+    It's only available on Unix.
+
+    It's mainly useful for debugging servers listening on Unix sockets.
+
+    Args:
+        path: File system path to the Unix socket.
+        uri: URI of the WebSocket server. ``uri`` defaults to
+            ``ws://localhost/`` or, when a ``ssl`` argument is provided, to
+            ``wss://localhost/``.
+
+    """
+    if uri is None:
+        if kwargs.get("ssl") is None:
+            uri = "ws://localhost/"
+        else:
+            uri = "wss://localhost/"
+    return connect(uri=uri, unix=True, path=path, **kwargs)
+
+
+try:
+    from python_socks import ProxyType
+    from python_socks.async_.asyncio import Proxy as SocksProxy
+
+except ImportError:
+
+    async def connect_socks_proxy(
+        proxy: Proxy,
+        ws_uri: WebSocketURI,
+        **kwargs: Any,
+    ) -> socket.socket:
+        raise ImportError("connecting through a SOCKS proxy requires python-socks")
+
+else:
+    SOCKS_PROXY_TYPES = {
+        "socks5h": ProxyType.SOCKS5,
+        "socks5": ProxyType.SOCKS5,
+        "socks4a": ProxyType.SOCKS4,
+        "socks4": ProxyType.SOCKS4,
+    }
+
+    SOCKS_PROXY_RDNS = {
+        "socks5h": True,
+        "socks5": False,
+        "socks4a": True,
+        "socks4": False,
+    }
+
+    async def connect_socks_proxy(
+        proxy: Proxy,
+        ws_uri: WebSocketURI,
+        **kwargs: Any,
+    ) -> socket.socket:
+        """Connect via a SOCKS proxy and return the socket."""
+        socks_proxy = SocksProxy(
+            SOCKS_PROXY_TYPES[proxy.scheme],
+            proxy.host,
+            proxy.port,
+            proxy.username,
+            proxy.password,
+            SOCKS_PROXY_RDNS[proxy.scheme],
         )
-        super().__init__(*args, **kwargs)
+        # connect() is documented to raise OSError.
+        # socks_proxy.connect() doesn't raise TimeoutError; it gets canceled.
+        # Wrap other exceptions in ProxyError, a subclass of InvalidHandshake.
+        try:
+            return await socks_proxy.connect(ws_uri.host, ws_uri.port, **kwargs)
+        except OSError:
+            raise
+        except Exception as exc:
+            raise ProxyError("failed to connect to SOCKS proxy") from exc
 
 
-def process_exception(exc: Exception) -> Exception | None:
-    """
-    Determine whether a connection error is retryable or fatal.
+class HTTPProxyConnection(asyncio.Protocol):
+    def __init__(
+        self,
+        ws_uri: WebSocketURI,
+        proxy: Proxy,
+        user_agent_header: str | None = None,
+    ):
+        self.ws_uri = ws_uri
+        self.proxy = proxy
+        self.user_agent_header = user_agent_header
 
-    When reconnecting automatically with ``async for ... in connect(...)``
-    (:mod:`asyncio`, :mod:`trio`) or ``for ... in reconnect(...)``
-    (:mod:`threading`), whenever a connection attempt fails,
-    :func:`process_exception` determines whether to retry connecting or to raise
-    the exception.
+        self.reader = StreamReader()
+        self.parser = Response.parse(
+            self.reader.read_line,
+            self.reader.read_exact,
+            self.reader.read_to_eof,
+            proxy=True,
+        )
 
-    This function defines the default behavior, which is to retry on:
+        loop = asyncio.get_running_loop()
+        self.response: asyncio.Future[Response] = loop.create_future()
 
-    * :exc:`OSError` and :exc:`asyncio.TimeoutError`: network errors;
-    * :exc:`~websockets.exceptions.InvalidMessage` when it stems from an
-      :exc:`EOFError`: also network errors;
-    * :exc:`~websockets.exceptions.InvalidStatus` when the status code is 500,
-      502, 503, or 504: server or proxy errors.
+    def run_parser(self) -> None:
+        if self.response.done():
+            return
+        try:
+            next(self.parser)
+        except StopIteration as exc:
+            response = exc.value
+            if 200 <= response.status_code < 300:
+                self.response.set_result(response)
+            else:
+                self.response.set_exception(InvalidProxyStatus(response))
+        except Exception as exc:
+            proxy_exc = InvalidProxyMessage(
+                "did not receive a valid HTTP response from proxy"
+            )
+            proxy_exc.__cause__ = exc
+            self.response.set_exception(proxy_exc)
 
-    All other exceptions are considered fatal.
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        transport = cast(asyncio.Transport, transport)
+        self.transport = transport
+        self.transport.write(
+            prepare_connect_request(self.proxy, self.ws_uri, self.user_agent_header)
+        )
 
-    You can change this behavior with the ``process_exception`` argument of
-    :func:`~websockets.asyncio.client.connect` (:mod:`asyncio`),
-    :func:`~websockets.trio.client.connect` (:mod:`trio`), or
-    :func:`~websockets.sync.client.reconnect` (:mod:`threading`).
+    def data_received(self, data: bytes) -> None:
+        self.reader.feed_data(data)
+        self.run_parser()
 
-    Return :obj:`None` if the exception is retryable i.e. when the error could
-    be transient and trying to reconnect with the same parameters could succeed.
-    The exception will be logged at the ``INFO`` level.
+    def eof_received(self) -> None:
+        self.reader.feed_eof()
+        self.run_parser()
 
-    Return an exception, either ``exc`` or a new exception, if the exception is
-    fatal i.e. when trying to reconnect will most likely produce the same error.
-    That exception will be raised, breaking out of the retry loop.
-
-    """
-    # This catches python-socks' ProxyConnectionError and ProxyTimeoutError.
-    if isinstance(exc, (OSError, TimeoutError)):
-        return None
-    if isinstance(exc, InvalidMessage) and isinstance(exc.__cause__, EOFError):
-        return None
-    if isinstance(exc, InvalidStatus) and exc.response.status_code in [
-        500,  # Internal Server Error
-        502,  # Bad Gateway
-        503,  # Service Unavailable
-        504,  # Gateway Timeout
-    ]:
-        return None
-    return exc
-
-
-BACKOFF_INITIAL_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_INITIAL_DELAY", "5"))
-BACKOFF_MIN_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_MIN_DELAY", "3.1"))
-BACKOFF_MAX_DELAY = float(os.environ.get("WEBSOCKETS_BACKOFF_MAX_DELAY", "90.0"))
-BACKOFF_FACTOR = float(os.environ.get("WEBSOCKETS_BACKOFF_FACTOR", "1.618"))
-
-
-def backoff(
-    initial_delay: float = BACKOFF_INITIAL_DELAY,
-    min_delay: float = BACKOFF_MIN_DELAY,
-    max_delay: float = BACKOFF_MAX_DELAY,
-    factor: float = BACKOFF_FACTOR,
-) -> Generator[float]:
-    """
-    Generate a series of backoff delays between reconnection attempts.
-
-    Yields:
-        How many seconds to wait before retrying to connect.
-
-    """
-    # Add a random initial delay between 0 and 5 seconds.
-    # See 7.2.3. Recovering from Abnormal Closure in RFC 6455.
-    yield random.random() * initial_delay
-    delay = min_delay
-    while delay < max_delay:
-        yield delay
-        delay *= factor
-    while True:
-        yield max_delay
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.reader.feed_eof()
+        self.run_parser()
 
 
-lazy_import(
-    globals(),
-    deprecated_aliases={
-        # deprecated in 14.0 - 2024-11-09
-        "WebSocketClientProtocol": ".legacy.client",
-        "connect": ".legacy.client",
-        "unix_connect": ".legacy.client",
-    },
-)
+async def connect_http_proxy(
+    proxy: Proxy,
+    ws_uri: WebSocketURI,
+    *,
+    user_agent_header: str | None = None,
+    **kwargs: Any,
+) -> asyncio.Transport:
+    transport, protocol = await asyncio.get_running_loop().create_connection(
+        lambda: HTTPProxyConnection(ws_uri, proxy, user_agent_header),
+        proxy.host,
+        proxy.port,
+        **kwargs,
+    )
+
+    try:
+        # This raises exceptions if the connection to the proxy fails.
+        await protocol.response
+    except (asyncio.CancelledError, Exception):
+        transport.abort()
+        raise
+
+    return transport
