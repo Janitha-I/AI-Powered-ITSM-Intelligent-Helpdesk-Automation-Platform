@@ -1,71 +1,73 @@
-import http
+from __future__ import annotations
 
-from .. import datastructures
-from ..exceptions import (
-    InvalidHandshake,
-    # InvalidMessage was incorrectly moved here in versions 14.0 and 14.1.
-    InvalidMessage,  # noqa: F401
-    ProtocolError as WebSocketProtocolError,  # noqa: F401
+from collections.abc import Mapping
+from typing import Any
+
+from starlette._exception_handler import (
+    ExceptionHandlers,
+    StatusHandlers,
+    wrap_app_handling_exceptions,
 )
-from ..typing import StatusLike
+from starlette.exceptions import HTTPException, WebSocketException
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.types import ASGIApp, ExceptionHandler, Receive, Scope, Send
+from starlette.websockets import WebSocket
 
 
-class InvalidStatusCode(InvalidHandshake):
-    """
-    Raised when a handshake response status code is invalid.
-
-    """
-
-    def __init__(self, status_code: int, headers: datastructures.Headers) -> None:
-        self.status_code = status_code
-        self.headers = headers
-
-    def __str__(self) -> str:
-        return f"server rejected WebSocket connection: HTTP {self.status_code}"
-
-
-class AbortHandshake(InvalidHandshake):
-    """
-    Raised to abort the handshake on purpose and return an HTTP response.
-
-    This exception is an implementation detail.
-
-    The public API is
-    :meth:`~websockets.legacy.server.WebSocketServerProtocol.process_request`.
-
-    Attributes:
-        status (~http.HTTPStatus): HTTP status code.
-        headers (Headers): HTTP response headers.
-        body (bytes): HTTP response body.
-    """
-
+class ExceptionMiddleware:
     def __init__(
         self,
-        status: StatusLike,
-        headers: datastructures.HeadersLike,
-        body: bytes = b"",
+        app: ASGIApp,
+        handlers: Mapping[Any, ExceptionHandler] | None = None,
+        debug: bool = False,
     ) -> None:
-        # If a user passes an int instead of an HTTPStatus, fix it automatically.
-        self.status = http.HTTPStatus(status)
-        self.headers = datastructures.Headers(headers)
-        self.body = body
+        self.app = app
+        self.debug = debug  # TODO: We ought to handle 404 cases if debug is set.
+        self._status_handlers: StatusHandlers = {}
+        self._exception_handlers: ExceptionHandlers = {
+            HTTPException: self.http_exception,
+            WebSocketException: self.websocket_exception,
+        }
+        if handlers is not None:  # pragma: no branch
+            for key, value in handlers.items():
+                self.add_exception_handler(key, value)
 
-    def __str__(self) -> str:
-        return (
-            f"HTTP {self.status:d}, {len(self.headers)} headers, {len(self.body)} bytes"
+    def add_exception_handler(
+        self,
+        exc_class_or_status_code: int | type[Exception],
+        handler: ExceptionHandler,
+    ) -> None:
+        if isinstance(exc_class_or_status_code, int):
+            self._status_handlers[exc_class_or_status_code] = handler
+        else:
+            assert issubclass(exc_class_or_status_code, Exception)
+            self._exception_handlers[exc_class_or_status_code] = handler
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        scope["starlette.exception_handlers"] = (
+            self._exception_handlers,
+            self._status_handlers,
         )
 
+        conn: Request | WebSocket
+        if scope["type"] == "http":
+            conn = Request(scope, receive, send)
+        else:
+            conn = WebSocket(scope, receive, send)
 
-class RedirectHandshake(InvalidHandshake):
-    """
-    Raised when a handshake gets redirected.
+        await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
 
-    This exception is an implementation detail.
+    async def http_exception(self, request: Request, exc: Exception) -> Response:
+        assert isinstance(exc, HTTPException)
+        if exc.status_code in {204, 304}:
+            return Response(status_code=exc.status_code, headers=exc.headers)
+        return PlainTextResponse(exc.detail, status_code=exc.status_code, headers=exc.headers)
 
-    """
-
-    def __init__(self, uri: str) -> None:
-        self.uri = uri
-
-    def __str__(self) -> str:
-        return f"redirect to {self.uri}"
+    async def websocket_exception(self, websocket: WebSocket, exc: Exception) -> None:
+        assert isinstance(exc, WebSocketException)
+        await websocket.close(code=exc.code, reason=exc.reason)  # pragma: no cover
