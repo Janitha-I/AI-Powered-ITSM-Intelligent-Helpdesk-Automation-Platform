@@ -1,9 +1,17 @@
-"""The pytest entry point."""
+"""
+    pygments.__main__
+    ~~~~~~~~~~~~~~~~~
 
-from __future__ import annotations
+    Main entry point for ``python -m pygments``.
 
-import pytest
+    :copyright: Copyright 2006-present by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
 
+import sys
+import pygments.cmdline
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.console_main())
+try:
+    sys.exit(pygments.cmdline.main(sys.argv))
+except KeyboardInterrupt:
+    sys.exit(1)
