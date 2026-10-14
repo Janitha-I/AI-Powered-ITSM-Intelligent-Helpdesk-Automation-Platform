@@ -1,5 +1,4 @@
-from .cli import main
-
+import uvicorn
 
 if __name__ == "__main__":
-    main()
+    uvicorn.main()

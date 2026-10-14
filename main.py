@@ -1,180 +1,656 @@
+from __future__ import annotations
+
 import asyncio
+import logging
 import os
-from datetime import datetime
-from pathlib import Path
-from typing import Any
-from uuid import uuid4
+import platform
+import ssl
+import sys
+import warnings
+from collections.abc import Callable
+from configparser import RawConfigParser
+from typing import IO, Any, get_args
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import click
 
-from .services import KNOWLEDGE, classify_request, dense_embedding, generate_grounded_answer, huggingface_embedding, vector_index
-from .servicenow import servicenow
-from .storage import store
+import uvicorn
+from uvicorn._types import ASGIApplication
+from uvicorn.config import (
+    INTERFACES,
+    LIFESPAN,
+    LOG_LEVELS,
+    LOGGING_CONFIG,
+    SSL_PROTOCOL_VERSION,
+    STARTUP_FAILURE,
+    Config,
+    HTTPProtocolType,
+    InterfaceType,
+    LifespanType,
+    LoopFactoryType,
+    WSProtocolType,
+)
+from uvicorn.server import Server
+from uvicorn.supervisors import ChangeReload, Multiprocess
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-app = FastAPI(title="SORIM.Ai ITSM Helpdesk API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
-
-
-class TextRequest(BaseModel):
-    message: str = Field(min_length=3, max_length=2000)
-    requester: str = "Alex Morgan"
-
-
-class ProvisionRequest(BaseModel):
-    software: str = Field(min_length=2, max_length=120)
-    requester: str = "Alex Morgan"
-    justification: str = ""
-
-
-class IncidentUpdate(BaseModel):
-    status: str | None = None
-    assigned_to: str | None = None
-    title: str | None = None
+LEVEL_CHOICES = click.Choice(list(LOG_LEVELS.keys()))
+LIFESPAN_CHOICES = click.Choice(list(LIFESPAN.keys()))
+INTERFACE_CHOICES = click.Choice(INTERFACES)
 
 
-def serializable_ticket(ticket: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in ticket.items() if key != "created_at"}
+def _metavar_from_type(_type: Any) -> str:
+    return f"[{'|'.join(key for key in get_args(_type) if key != 'none')}]"
 
 
-_atlas_indexed = False
-_atlas_uses_model_embeddings = False
+logger = logging.getLogger("uvicorn.error")
 
 
-async def retrieve_knowledge(query: str, limit: int = 3) -> list[dict[str, Any]]:
-    global _atlas_indexed, _atlas_uses_model_embeddings
-    if store.connected:
-        documents = [f"{doc['title']} {doc['category']} {' '.join(doc['tags'])} {doc['content']}" for doc in KNOWLEDGE]
-        if not _atlas_indexed:
-            model_embeddings = await asyncio.gather(*(huggingface_embedding(text) for text in documents)) if os.getenv("HUGGINGFACE_API_TOKEN") else []
-            if model_embeddings and all(embedding is not None for embedding in model_embeddings):
-                embeddings = model_embeddings
-                _atlas_uses_model_embeddings = True
-            else:
-                embeddings = [dense_embedding(text) for text in documents]
-            store.index_knowledge(KNOWLEDGE, embeddings)
-            _atlas_indexed = True
-        query_embedding = await huggingface_embedding(query) if _atlas_uses_model_embeddings else dense_embedding(query)
-        if query_embedding:
-            atlas_results = store.search_knowledge_vectors(query_embedding, limit)
+def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(
+        "Running uvicorn {version} with {py_implementation} {py_version} on {system}".format(  # noqa: UP032
+            version=uvicorn.__version__,
+            py_implementation=platform.python_implementation(),
+            py_version=platform.python_version(),
+            system=platform.system(),
+        )
+    )
+    ctx.exit()
+
+
+@click.command(context_settings={"auto_envvar_prefix": "UVICORN"})
+@click.argument("app", envvar="UVICORN_APP")
+@click.option(
+    "--host",
+    type=str,
+    default="127.0.0.1",
+    help="Bind socket to this host.",
+    show_default=True,
+)
+@click.option(
+    "--port",
+    type=int,
+    default=8000,
+    help="Bind socket to this port. If 0, an available port will be picked.",
+    show_default=True,
+)
+@click.option("--uds", type=str, default=None, help="Bind to a UNIX domain socket.")
+@click.option("--fd", type=int, default=None, help="Bind to socket from this file descriptor.")
+@click.option("--reload", is_flag=True, default=False, help="Enable auto-reload.")
+@click.option(
+    "--reload-dir",
+    "reload_dirs",
+    multiple=True,
+    help="Set reload directories explicitly, instead of using the current working directory.",
+    type=click.Path(exists=True),
+)
+@click.option(
+    "--reload-include",
+    "reload_includes",
+    multiple=True,
+    help="Set glob patterns to include while watching for files. Includes '*.py' "
+    "by default; these defaults can be overridden with `--reload-exclude`. "
+    "This option has no effect unless watchfiles is installed.",
+)
+@click.option(
+    "--reload-exclude",
+    "reload_excludes",
+    multiple=True,
+    help="Set glob patterns to exclude while watching for files. Includes "
+    "'.*, .py[cod], .sw.*, ~*' by default; these defaults can be overridden "
+    "with `--reload-include`. This option has no effect unless watchfiles is "
+    "installed.",
+)
+@click.option(
+    "--reload-delay",
+    type=float,
+    default=0.25,
+    show_default=True,
+    help="Delay between previous and next check if application needs to be. Defaults to 0.25s.",
+)
+@click.option(
+    "--workers",
+    default=None,
+    type=int,
+    help="Number of worker processes. Defaults to the $WEB_CONCURRENCY environment"
+    " variable if available, or 1. Not valid with --reload.",
+)
+@click.option(
+    "--loop",
+    type=str,
+    metavar=_metavar_from_type(LoopFactoryType),
+    default="auto",
+    help="Event loop factory implementation.",
+    show_default=True,
+)
+@click.option(
+    "--http",
+    type=str,
+    metavar=_metavar_from_type(HTTPProtocolType),
+    default="auto",
+    help="HTTP protocol implementation.",
+    show_default=True,
+)
+@click.option(
+    "--http2",
+    is_flag=True,
+    default=False,
+    help="Enable HTTP/2 support. Requires --http zttp.",
+    show_default=True,
+)
+@click.option(
+    "--ws",
+    type=str,
+    metavar=_metavar_from_type(WSProtocolType),
+    default="auto",
+    help="WebSocket protocol implementation.",
+    show_default=True,
+)
+@click.option(
+    "--ws-max-size",
+    type=int,
+    default=16777216,
+    help="WebSocket max size message in bytes",
+    show_default=True,
+)
+@click.option(
+    "--ws-max-queue",
+    type=int,
+    default=32,
+    help="The maximum length of the WebSocket message queue.",
+    show_default=True,
+)
+@click.option(
+    "--ws-ping-interval",
+    type=float,
+    default=20.0,
+    help="WebSocket ping interval in seconds.",
+    show_default=True,
+)
+@click.option(
+    "--ws-ping-timeout",
+    type=float,
+    default=20.0,
+    help="WebSocket ping timeout in seconds.",
+    show_default=True,
+)
+@click.option(
+    "--ws-per-message-deflate",
+    type=bool,
+    default=True,
+    help="WebSocket per-message-deflate compression",
+    show_default=True,
+)
+@click.option(
+    "--lifespan",
+    type=LIFESPAN_CHOICES,
+    default="auto",
+    help="Lifespan implementation.",
+    show_default=True,
+)
+@click.option(
+    "--interface",
+    type=INTERFACE_CHOICES,
+    default="auto",
+    help="Select ASGI3, ASGI2, or WSGI as the application interface.",
+    show_default=True,
+)
+@click.option(
+    "--env-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Environment configuration file.",
+    show_default=True,
+)
+@click.option(
+    "--log-config",
+    type=click.Path(exists=True),
+    default=None,
+    help="Logging configuration file. Supported formats: .ini, .json, .yaml.",
+    show_default=True,
+)
+@click.option(
+    "--log-level",
+    type=LEVEL_CHOICES,
+    default=None,
+    help="Log level. [default: info]",
+    show_default=True,
+)
+@click.option(
+    "--access-log/--no-access-log",
+    is_flag=True,
+    default=True,
+    help="Enable/Disable access log.",
+)
+@click.option(
+    "--use-colors/--no-use-colors",
+    is_flag=True,
+    default=None,
+    help="Enable/Disable colorized logging.",
+)
+@click.option(
+    "--proxy-headers/--no-proxy-headers",
+    is_flag=True,
+    default=True,
+    help="Enable/Disable X-Forwarded-Proto, X-Forwarded-For to populate url scheme and remote address info.",
+)
+@click.option(
+    "--server-header/--no-server-header",
+    is_flag=True,
+    default=True,
+    help="Enable/Disable default Server header.",
+)
+@click.option(
+    "--date-header/--no-date-header",
+    is_flag=True,
+    default=True,
+    help="Enable/Disable default Date header.",
+)
+@click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default=None,
+    help="Comma separated list of IP Addresses, IP Networks, or literals "
+    "(e.g. UNIX Socket path) to trust with proxy headers. Defaults to the "
+    "$FORWARDED_ALLOW_IPS environment variable if available, or '127.0.0.1,::1'. "
+    "The literal '*' means trust everything.",
+)
+@click.option(
+    "--root-path",
+    type=str,
+    default="",
+    help="Set the ASGI 'root_path' for applications submounted below a given URL path.",
+)
+@click.option(
+    "--limit-concurrency",
+    type=int,
+    default=None,
+    help="Maximum number of concurrent connections or tasks to allow, before issuing HTTP 503 responses.",
+)
+@click.option(
+    "--backlog",
+    type=int,
+    default=2048,
+    help="Maximum number of connections to hold in backlog",
+)
+@click.option(
+    "--limit-max-requests",
+    type=int,
+    default=None,
+    help="Maximum number of requests to service before terminating the process.",
+)
+@click.option(
+    "--limit-max-requests-jitter",
+    type=int,
+    default=0,
+    help="Maximum jitter to add to limit_max_requests."
+    " Staggers worker restarts to avoid all workers restarting simultaneously.",
+    show_default=True,
+)
+@click.option(
+    "--timeout-keep-alive",
+    type=int,
+    default=5,
+    help="Close Keep-Alive connections if no new data is received within this timeout (in seconds).",
+    show_default=True,
+)
+@click.option(
+    "--timeout-graceful-shutdown",
+    type=int,
+    default=None,
+    help="Maximum number of seconds to wait for graceful shutdown.",
+)
+@click.option(
+    "--timeout-worker-healthcheck",
+    type=int,
+    default=5,
+    help="Maximum number of seconds to wait for a worker to respond to a healthcheck.",
+    show_default=True,
+)
+@click.option("--ssl-keyfile", type=str, default=None, help="SSL key file", show_default=True)
+@click.option(
+    "--ssl-certfile",
+    type=str,
+    default=None,
+    help="SSL certificate file",
+    show_default=True,
+)
+@click.option(
+    "--ssl-keyfile-password",
+    type=str,
+    default=None,
+    help="SSL keyfile password",
+    show_default=True,
+)
+@click.option(
+    "--ssl-version",
+    type=int,
+    default=int(SSL_PROTOCOL_VERSION),
+    help="SSL version to use (see stdlib ssl module's)",
+    show_default=True,
+)
+@click.option(
+    "--ssl-cert-reqs",
+    type=int,
+    default=int(ssl.CERT_NONE),
+    help="Whether client certificate is required (see stdlib ssl module's)",
+    show_default=True,
+)
+@click.option(
+    "--ssl-ca-certs",
+    type=str,
+    default=None,
+    help="CA certificates file",
+    show_default=True,
+)
+@click.option(
+    "--ssl-ciphers",
+    type=str,
+    default=None,
+    help="Ciphers to use (see stdlib ssl module's). Defaults to OpenSSL's safe defaults.",
+    show_default=True,
+)
+@click.option(
+    "--header",
+    "headers",
+    multiple=True,
+    help="Specify custom default HTTP response headers as a Name:Value pair",
+)
+@click.option(
+    "--version",
+    is_flag=True,
+    callback=print_version,
+    expose_value=False,
+    is_eager=True,
+    help="Display the uvicorn version and exit.",
+)
+@click.option(
+    "--app-dir",
+    default="",
+    show_default=True,
+    help="Look for APP in the specified directory, by adding this to the PYTHONPATH."
+    " Defaults to the current working directory.",
+)
+@click.option(
+    "--h11-max-incomplete-event-size",
+    "h11_max_incomplete_event_size",
+    type=int,
+    default=None,
+    help="For h11, the maximum number of bytes to buffer of an incomplete event.",
+)
+@click.option(
+    "--reset-contextvars",
+    is_flag=True,
+    default=False,
+    help="Run each ASGI request in a fresh contextvars.Context. Hides context set in the lifespan.",
+    show_default=True,
+)
+@click.option(
+    "--factory",
+    is_flag=True,
+    default=False,
+    help="Treat APP as an application factory, i.e. a () -> <ASGI app> callable.",
+    show_default=True,
+)
+def main(
+    app: str,
+    host: str,
+    port: int,
+    uds: str,
+    fd: int,
+    loop: LoopFactoryType | str,
+    http: HTTPProtocolType | str,
+    http2: bool,
+    ws: WSProtocolType | str,
+    ws_max_size: int,
+    ws_max_queue: int,
+    ws_ping_interval: float,
+    ws_ping_timeout: float,
+    ws_per_message_deflate: bool,
+    lifespan: LifespanType,
+    interface: InterfaceType,
+    reload: bool,
+    reload_dirs: list[str],
+    reload_includes: list[str],
+    reload_excludes: list[str],
+    reload_delay: float,
+    workers: int,
+    env_file: str,
+    log_config: str,
+    log_level: str,
+    access_log: bool,
+    proxy_headers: bool,
+    server_header: bool,
+    date_header: bool,
+    forwarded_allow_ips: str,
+    root_path: str,
+    limit_concurrency: int,
+    backlog: int,
+    limit_max_requests: int,
+    limit_max_requests_jitter: int,
+    timeout_keep_alive: int,
+    timeout_graceful_shutdown: int | None,
+    timeout_worker_healthcheck: int,
+    ssl_keyfile: str,
+    ssl_certfile: str,
+    ssl_keyfile_password: str,
+    ssl_version: int,
+    ssl_cert_reqs: int,
+    ssl_ca_certs: str,
+    ssl_ciphers: str | None,
+    headers: list[str],
+    use_colors: bool,
+    app_dir: str,
+    h11_max_incomplete_event_size: int | None,
+    reset_contextvars: bool,
+    factory: bool,
+) -> None:
+    run(
+        app,
+        host=host,
+        port=port,
+        uds=uds,
+        fd=fd,
+        loop=loop,
+        http=http,
+        http2=http2,
+        ws=ws,
+        ws_max_size=ws_max_size,
+        ws_max_queue=ws_max_queue,
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
+        ws_per_message_deflate=ws_per_message_deflate,
+        lifespan=lifespan,
+        env_file=env_file,
+        log_config=LOGGING_CONFIG if log_config is None else log_config,
+        log_level=log_level,
+        access_log=access_log,
+        interface=interface,
+        reload=reload,
+        reload_dirs=reload_dirs or None,
+        reload_includes=reload_includes or None,
+        reload_excludes=reload_excludes or None,
+        reload_delay=reload_delay,
+        workers=workers,
+        proxy_headers=proxy_headers,
+        server_header=server_header,
+        date_header=date_header,
+        forwarded_allow_ips=forwarded_allow_ips,
+        root_path=root_path,
+        limit_concurrency=limit_concurrency,
+        backlog=backlog,
+        limit_max_requests=limit_max_requests,
+        limit_max_requests_jitter=limit_max_requests_jitter,
+        timeout_keep_alive=timeout_keep_alive,
+        timeout_graceful_shutdown=timeout_graceful_shutdown,
+        timeout_worker_healthcheck=timeout_worker_healthcheck,
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile_password=ssl_keyfile_password,
+        ssl_version=ssl_version,
+        ssl_cert_reqs=ssl_cert_reqs,
+        ssl_ca_certs=ssl_ca_certs,
+        ssl_ciphers=ssl_ciphers,
+        headers=[header.split(":", 1) for header in headers],  # type: ignore[misc]
+        use_colors=use_colors,
+        factory=factory,
+        app_dir=app_dir,
+        h11_max_incomplete_event_size=h11_max_incomplete_event_size,
+        reset_contextvars=reset_contextvars,
+    )
+
+
+def run(
+    app: ASGIApplication | Callable[..., Any] | str,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    uds: str | None = None,
+    fd: int | None = None,
+    loop: LoopFactoryType | str = "auto",
+    http: type[asyncio.Protocol] | HTTPProtocolType | str = "auto",
+    http2: bool = False,
+    ws: type[asyncio.Protocol] | WSProtocolType | str = "auto",
+    ws_max_size: int = 16777216,
+    ws_max_queue: int = 32,
+    ws_ping_interval: float | None = 20.0,
+    ws_ping_timeout: float | None = 20.0,
+    ws_per_message_deflate: bool = True,
+    lifespan: LifespanType = "auto",
+    interface: InterfaceType = "auto",
+    reload: bool = False,
+    reload_dirs: list[str] | str | None = None,
+    reload_includes: list[str] | str | None = None,
+    reload_excludes: list[str] | str | None = None,
+    reload_delay: float = 0.25,
+    workers: int | None = None,
+    env_file: str | os.PathLike[str] | None = None,
+    log_config: dict[str, Any] | str | os.PathLike[str] | RawConfigParser | IO[Any] | None = LOGGING_CONFIG,
+    log_level: str | int | None = None,
+    access_log: bool = True,
+    proxy_headers: bool = True,
+    server_header: bool = True,
+    date_header: bool = True,
+    forwarded_allow_ips: list[str] | str | None = None,
+    root_path: str = "",
+    limit_concurrency: int | None = None,
+    backlog: int = 2048,
+    limit_max_requests: int | None = None,
+    limit_max_requests_jitter: int = 0,
+    timeout_keep_alive: int = 5,
+    timeout_graceful_shutdown: int | None = None,
+    timeout_worker_healthcheck: int = 5,
+    ssl_keyfile: str | os.PathLike[str] | None = None,
+    ssl_certfile: str | os.PathLike[str] | None = None,
+    ssl_keyfile_password: str | None = None,
+    ssl_version: int = SSL_PROTOCOL_VERSION,
+    ssl_cert_reqs: int = ssl.CERT_NONE,
+    ssl_ca_certs: str | os.PathLike[str] | None = None,
+    ssl_ciphers: str | None = None,
+    ssl_context_factory: Callable[[Config, Callable[[], ssl.SSLContext]], ssl.SSLContext] | None = None,
+    headers: list[tuple[str, str]] | None = None,
+    use_colors: bool | None = None,
+    app_dir: str | None = None,
+    factory: bool = False,
+    h11_max_incomplete_event_size: int | None = None,
+    reset_contextvars: bool = False,
+) -> None:
+    if app_dir is not None:
+        sys.path.insert(0, app_dir)
+
+    config = Config(
+        app,
+        host=host,
+        port=port,
+        uds=uds,
+        fd=fd,
+        loop=loop,
+        http=http,
+        http2=http2,
+        ws=ws,
+        ws_max_size=ws_max_size,
+        ws_max_queue=ws_max_queue,
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
+        ws_per_message_deflate=ws_per_message_deflate,
+        lifespan=lifespan,
+        interface=interface,
+        reload=reload,
+        reload_dirs=reload_dirs,
+        reload_includes=reload_includes,
+        reload_excludes=reload_excludes,
+        reload_delay=reload_delay,
+        workers=workers,
+        env_file=env_file,
+        log_config=log_config,
+        log_level=log_level,
+        access_log=access_log,
+        proxy_headers=proxy_headers,
+        server_header=server_header,
+        date_header=date_header,
+        forwarded_allow_ips=forwarded_allow_ips,
+        root_path=root_path,
+        limit_concurrency=limit_concurrency,
+        backlog=backlog,
+        limit_max_requests=limit_max_requests,
+        limit_max_requests_jitter=limit_max_requests_jitter,
+        timeout_keep_alive=timeout_keep_alive,
+        timeout_graceful_shutdown=timeout_graceful_shutdown,
+        timeout_worker_healthcheck=timeout_worker_healthcheck,
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile_password=ssl_keyfile_password,
+        ssl_version=ssl_version,
+        ssl_cert_reqs=ssl_cert_reqs,
+        ssl_ca_certs=ssl_ca_certs,
+        ssl_ciphers=ssl_ciphers,
+        ssl_context_factory=ssl_context_factory,
+        headers=headers,
+        use_colors=use_colors,
+        factory=factory,
+        h11_max_incomplete_event_size=h11_max_incomplete_event_size,
+        reset_contextvars=reset_contextvars,
+    )
+    if config.reload or config.workers > 1:
+        if not isinstance(app, str):
+            logger = logging.getLogger("uvicorn.error")
+            logger.warning("You must pass the application as an import string to enable 'reload' or 'workers'.")
+            sys.exit(STARTUP_FAILURE)
+    else:
+        config.load_app()
+
+    server = Server(config=config)
+
+    try:
+        if config.should_reload:
+            sock = config.bind_socket()
+            ChangeReload(config, target=server.run, sockets=[sock]).run()
+        elif config.workers > 1:
+            sock = config.bind_socket()
+            Multiprocess(config, sockets=[sock]).run()
         else:
-            atlas_results = None
-        if atlas_results:
-            return [{**result, "score": round(float(result.get("score", 0)), 3)} for result in atlas_results]
-    return vector_index.search(query, limit)
+            server.run()
+    except KeyboardInterrupt:  # pragma: full coverage
+        pass
+    finally:
+        if config.uds and os.path.exists(config.uds):
+            os.remove(config.uds)  # pragma: py-win32
+
+    if not server.started and not config.should_reload and config.workers == 1:
+        sys.exit(STARTUP_FAILURE)
 
 
-@app.get("/api/health")
-def health() -> dict[str, Any]:
-    return {"status": "ok", "database": "MongoDB Atlas" if store.connected else "local demo store", "ai": "Hugging Face" if os.getenv("HUGGINGFACE_API_TOKEN") else "grounded fallback", "servicenow": "connected" if servicenow.configured else "mock"}
+def __getattr__(name: str) -> Any:
+    if name == "ServerState":
+        warnings.warn(
+            "uvicorn.main.ServerState is deprecated, use uvicorn.server.ServerState instead.",
+            DeprecationWarning,
+        )
+        from uvicorn.server import ServerState
+
+        return ServerState
+    raise AttributeError(f"module {__name__} has no attribute {name}")
 
 
-@app.get("/api/dashboard")
-def dashboard() -> dict[str, Any]:
-    tickets = store.list_tickets()
-    return {"metrics": {"open_tickets": sum(ticket["status"] not in ("Resolved", "Closed") for ticket in tickets), "resolved_today": 28, "automation_rate": 74, "avg_resolution": "18m"}, "tickets": [serializable_ticket(ticket) for ticket in tickets[:8]], "activity": store.activity}
-
-
-@app.get("/api/tickets")
-def tickets() -> list[dict[str, Any]]:
-    return [serializable_ticket(ticket) for ticket in store.list_tickets()]
-
-
-@app.get("/api/knowledge")
-async def knowledge(query: str = "", limit: int = 10) -> list[dict[str, Any]]:
-    return await retrieve_knowledge(query, max(1, min(limit, 20))) if query else KNOWLEDGE
-
-
-@app.post("/api/intake")
-async def intake(request: TextRequest) -> dict[str, Any]:
-    details = classify_request(request.message)
-    matches = await retrieve_knowledge(request.message)
-    answer, model = await generate_grounded_answer(request.message, matches)
-    ticket_id = f"INC{uuid4().hex[:6].upper()}"
-    ticket = {"id": ticket_id, "title": request.message[:72], "requester": request.requester, "category": details["category"], "priority": details["priority"], "status": "Open", "assigned_to": details["assignment_group"], "created": datetime.now().strftime("%H:%M"), "source": "Self-service", **details}
-    if servicenow.configured and details["intent"] == "Incident":
-        try:
-            remote = await servicenow.create_incident(ticket)
-            ticket["id"] = remote.get("number", ticket_id)
-            ticket["servicenow_sys_id"] = remote.get("sys_id")
-        except Exception:
-            ticket["integration_warning"] = "ServiceNow incident creation failed; saved in the local prototype store."
-    ticket_id = ticket["id"]
-    created = store.create_ticket(ticket)
-    store.record_activity({"label": f"Ticket {ticket_id} created and classified", "detail": f"{request.requester} · {details['assignment_group']}", "time": "Just now", "kind": "route"})
-    return {"ticket": serializable_ticket(created), "classification": details, "answer": answer, "model": model, "sources": matches}
-
-
-@app.post("/api/chat")
-async def chat(request: TextRequest) -> dict[str, Any]:
-    matches = await retrieve_knowledge(request.message)
-    answer, model = await generate_grounded_answer(request.message, matches)
-    return {"answer": answer, "model": model, "sources": matches, "confidence": matches[0]["score"] if matches else 0}
-
-
-@app.get("/api/servicenow/incidents/{incident_number}")
-async def get_incident(incident_number: str) -> dict[str, Any]:
-    if servicenow.configured:
-        try:
-            return await servicenow.get_incident(incident_number)
-        except Exception as error:
-            raise HTTPException(status_code=502, detail="ServiceNow could not retrieve this incident.") from error
-    ticket = next((ticket for ticket in store.list_tickets() if ticket["id"] == incident_number), None)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="Incident not found in the demo store.")
-    return serializable_ticket(ticket)
-
-
-@app.patch("/api/servicenow/incidents/{incident_number}")
-async def update_incident(incident_number: str, request: IncidentUpdate) -> dict[str, Any]:
-    updates = request.model_dump(exclude_none=True)
-    if not updates:
-        raise HTTPException(status_code=400, detail="Provide at least one incident field to update.")
-    if servicenow.configured:
-        try:
-            return await servicenow.update_incident(incident_number, updates)
-        except Exception as error:
-            raise HTTPException(status_code=502, detail="ServiceNow could not update this incident.") from error
-    ticket = store.update_ticket(incident_number, updates)
-    if ticket is None:
-        raise HTTPException(status_code=404, detail="Incident not found in the demo store.")
-    store.record_activity({"label": f"Incident {incident_number} updated", "detail": ", ".join(updates), "time": "Just now", "kind": "route"})
-    return serializable_ticket(ticket)
-
-
-@app.post("/api/automation/{action}")
-def automate(action: str, request: TextRequest) -> dict[str, Any]:
-    actions = {
-        "password-reset": ("Password reset", "Identity and Access Support", "Approved reset flow started. The user must finish verification in the identity portal."),
-        "account-unlock": ("Account unlock", "Identity and Access Support", "Account unlock request queued after identity verification."),
-        "vpn-check": ("VPN diagnostics", "Network Support", "Device time, VPN profile, and connection checks recorded. No password or MFA code was collected."),
-        "restart-app": ("Application restart", "Endpoint Support", "Restart instructions sent. Escalate if the issue persists."),
-    }
-    if action not in actions:
-        raise HTTPException(status_code=404, detail="Automation is not available.")
-    title, group, result = actions[action]
-    audit = {"label": f"{title} automation completed", "detail": f"{request.requester} · {action}", "time": "Just now", "kind": "success"}
-    store.record_activity(audit)
-    return {"status": "completed", "action": action, "result": result, "audit": audit, "requires_human": action in ("password-reset", "account-unlock")}
-
-
-@app.post("/api/provision")
-async def provision(request: ProvisionRequest) -> dict[str, Any]:
-    request_id = f"REQ{uuid4().hex[:6].upper()}"
-    is_mock = not servicenow.configured
-    result = {"id": request_id, "title": f"{request.software} installation", "requester": request.requester, "category": "Software / Access", "priority": "P3", "status": "Provisioning", "assigned_to": "Software Support", "created": datetime.now().strftime("%H:%M"), "source": "Self-service", "justification": request.justification, "servicenow": "mock request created" if is_mock else "request submitted"}
-    if not is_mock:
-        try:
-            remote = await servicenow.create_request(result)
-            result["id"] = remote.get("number", request_id)
-            result["servicenow_sys_id"] = remote.get("sys_id")
-            request_id = result["id"]
-        except Exception:
-            is_mock = True
-            result["servicenow"] = "ServiceNow unavailable; mock request created"
-    store.create_ticket(result)
-    store.record_activity({"label": f"{request.software} request submitted", "detail": f"{request.requester} · {request_id}", "time": "Just now", "kind": "request"})
-    return {"request": serializable_ticket(result), "mock": is_mock}
+if __name__ == "__main__":
+    main()  # pragma: no cover

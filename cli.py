@@ -1,227 +1,225 @@
-from __future__ import annotations
-
 import argparse
-import asyncio
-import itertools
+import logging
 import os
-import ssl
+import shlex
 import sys
-import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from pathlib import Path
+from textwrap import dedent
+from typing import Any, cast
 
-from .asyncio.client import ClientConnection, connect
-from .exceptions import ConnectionClosed
-from .frames import Close
-from .version import version as websockets_version
+from . import Change
+from .filters import BaseFilter, DefaultFilter, PythonFilter
+from .run import detect_target_type, import_string, run_process
+from .version import VERSION
 
-
-__all__ = ["main"]
-
-# Escape ASCII control characters (0-31 and 128-159) as well as DEL (127).
-# Do not escape NO-BREAK SPACE (160) and SOFT HYPHEN (173), even if Python
-# considers them non-printable, since they don't cause issues in terminal.
-
-# >>> [i for i in range(256) if not any((
-# ...     chr(i).isprintable(),
-# ...     i < 32,
-# ...     i == 127,
-# ...     128 <= i < 160,
-# ... ))]
-# [160, 173]
-
-TERMINAL_ESCAPES = str.maketrans(
-    {i: repr(chr(i))[1:-1] for i in itertools.chain(range(32), range(127, 160))}
-)
+logger = logging.getLogger('watchfiles.cli')
 
 
-def escape(string: str) -> str:
-    """Make a string safe for a terminal by escaping control characters."""
-    return string.translate(TERMINAL_ESCAPES)
-
-
-def print_during_input(string: str) -> None:
-    sys.stdout.write(
-        # Save cursor position
-        "\N{ESC}7"
-        # Add a new line
-        "\N{LINE FEED}"
-        # Move cursor up
-        "\N{ESC}[A"
-        # Insert blank line, scroll last line down
-        "\N{ESC}[L"
-        # Print string in the inserted blank line
-        f"{string}\N{LINE FEED}"
-        # Restore cursor position
-        "\N{ESC}8"
-        # Move cursor down
-        "\N{ESC}[B"
-    )
-    sys.stdout.flush()
-
-
-def print_over_input(string: str) -> None:
-    sys.stdout.write(
-        # Move cursor to beginning of line
-        "\N{CARRIAGE RETURN}"
-        # Delete current line
-        "\N{ESC}[K"
-        # Print string
-        f"{string}\N{LINE FEED}"
-    )
-    sys.stdout.flush()
-
-
-async def print_incoming_messages(websocket: ClientConnection) -> None:
-    async for message in websocket:
-        if isinstance(message, str):
-            print_during_input("< " + escape(message))
-        else:
-            print_during_input("< (binary) " + message.hex())
-
-
-def read_outgoing_messages(
-    queue_for_sending: Callable[[str], None],
-    notify_end_of_file: Callable[[], None],
-) -> None:
-    while True:
-        sys.stdout.write("> ")
-        sys.stdout.flush()
-        line = sys.stdin.readline()
-        if not line:
-            notify_end_of_file()
-            break
-        message = line.rstrip("\r\n")
-        queue_for_sending(message)
-
-
-async def send_outgoing_messages(
-    websocket: ClientConnection,
-    messages: asyncio.Queue[str],
-) -> None:
-    while True:
-        message = await messages.get()
-        try:
-            await websocket.send(message)
-        except ConnectionClosed:  # pragma: no cover
-            break
-
-
-async def interactive_client(uri: str, **kwargs: Any) -> None:
-    try:
-        websocket = await connect(uri, **kwargs)
-    except Exception as exc:
-        print(f"Failed to connect to {uri}: {exc}.")
-        sys.exit(1)
+def resolve_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(path)
     else:
-        print(f"Connected to {uri}.")
-
-    # Read messages from stdin in a thread because Windows doesn't support
-    # reading asynchronously (#1681), and a daemon thread to avoid blocking
-    # Ctrl-C because signals are only delivered to the main thread.
-    loop = asyncio.get_event_loop()
-    messages: asyncio.Queue[str] = asyncio.Queue()
-    # When dropping support for Python < 3.13, change notify_end_of_file() to
-    # call messages.shutdown() and break when asyncio.QueueShutdownError is
-    # raised in send_outgoing_messages().
-    shutdown: asyncio.Future[None] = loop.create_future()
-
-    def queue_for_sending(message: str) -> None:
-        try:
-            loop.call_soon_threadsafe(messages.put_nowait, message)
-        except RuntimeError:  # Event loop is closed  # pragma: no cover
-            pass
-
-    def notify_end_of_file() -> None:
-        try:
-            loop.call_soon_threadsafe(shutdown.set_result, None)
-        except RuntimeError:  # Event loop is closed  # pragma: no cover
-            pass
-
-    threading.Thread(
-        target=read_outgoing_messages,
-        args=(queue_for_sending, notify_end_of_file),
-        daemon=True,
-    ).start()
-
-    incoming = asyncio.create_task(print_incoming_messages(websocket))
-    outgoing = asyncio.create_task(send_outgoing_messages(websocket, messages))
-    try:
-        await asyncio.wait(
-            [incoming, outgoing, shutdown],
-            # Clean up and exit when the server closes the connection
-            # or the user enters EOT (^D), whichever happens first.
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-    # asyncio.run() cancels the main task when the user triggers SIGINT (^C).
-    # https://docs.python.org/3/library/asyncio-runner.html#handling-keyboard-interruption
-    # Clean up and exit without re-raising CancelledError to prevent Python
-    # from raising KeyboardInterrupt and displaying a stack track.
-    except asyncio.CancelledError:  # pragma: no cover
-        pass
-    finally:
-        incoming.cancel()
-        outgoing.cancel()
-
-    await websocket.close()
-    assert websocket.close_code is not None and websocket.close_reason is not None
-    close_status = Close(websocket.close_code, websocket.close_reason)
-    print_over_input(f"Connection closed: {escape(str(close_status))}.")
+        return path.resolve()
 
 
-def main(argv: list[str] | None = None) -> None:
+def cli(*args_: str) -> None:
+    """
+    Watch one or more directories and execute either a shell command or a python function on file changes.
+
+    Example of watching the current directory and calling a python function:
+
+        watchfiles foobar.main
+
+    Example of watching python files in two local directories and calling a shell command:
+
+        watchfiles --filter python 'pytest --lf' src tests
+
+    See https://watchfiles.helpmanual.io/cli/ for more information.
+    """
+    args = args_ or sys.argv[1:]
     parser = argparse.ArgumentParser(
-        prog="websockets",
-        description="Interactive WebSocket client.",
-        add_help=False,
+        prog='watchfiles',
+        description=dedent((cli.__doc__ or '').strip('\n')),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument('target', help='Command or dotted function path to run')
+    parser.add_argument(
+        'paths', nargs='*', default='.', help='Filesystem paths to watch, defaults to current directory'
+    )
+
+    parser.add_argument(
+        '--ignore-paths',
+        nargs='?',
+        type=str,
+        help=(
+            'Specify directories to ignore, '
+            'to ignore multiple paths use a comma as separator, e.g. "env" or "env,node_modules"'
+        ),
     )
     parser.add_argument(
-        "--help",
-        action="store_true",
-        help="show usage and exit",
+        '--target-type',
+        nargs='?',
+        type=str,
+        default='auto',
+        choices=['command', 'function', 'auto'],
+        help=(
+            'Whether the target should be intercepted as a shell command or a python function, '
+            'defaults to "auto" which infers the target type from the target string'
+        ),
     )
     parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="disable TLS certificate verification",
+        '--filter',
+        nargs='?',
+        type=str,
+        default='default',
+        help=(
+            'Which files to watch, defaults to "default" which uses the "DefaultFilter", '
+            '"python" uses the "PythonFilter", "all" uses no filter, '
+            'any other value is interpreted as a python function/class path which is imported'
+        ),
     )
     parser.add_argument(
-        "--version",
-        action="store_true",
-        help="show version and exit",
+        '--args',
+        nargs='?',
+        type=str,
+        help='Arguments to set on sys.argv before calling target function, used only if the target is a function',
+    )
+    parser.add_argument('--verbose', action='store_true', help='Set log level to "debug", wins over `--verbosity`')
+    parser.add_argument(
+        '--non-recursive', action='store_true', help='Do not watch for changes in sub-directories recursively'
     )
     parser.add_argument(
-        "uri",
-        metavar="<uri>",
-        nargs="?",
+        '--verbosity',
+        nargs='?',
+        type=str,
+        default='info',
+        choices=['warning', 'info', 'debug'],
+        help='Log level, defaults to "info"',
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        '--sigint-timeout',
+        nargs='?',
+        type=int,
+        default=5,
+        help='How long to wait for the sigint timeout before sending sigkill.',
+    )
+    parser.add_argument(
+        '--grace-period',
+        nargs='?',
+        type=float,
+        default=0,
+        help='Number of seconds after the process is started before watching for changes.',
+    )
+    parser.add_argument(
+        '--sigkill-timeout',
+        nargs='?',
+        type=int,
+        default=1,
+        help='How long to wait for the sigkill timeout before issuing a timeout exception.',
+    )
+    parser.add_argument(
+        '--ignore-permission-denied',
+        action='store_true',
+        help='Ignore permission denied errors while watching files and directories.',
+    )
+    parser.add_argument('--version', '-V', action='version', version=f'%(prog)s v{VERSION}')
+    arg_namespace = parser.parse_args(args)
 
-    if args.help:
-        parser.print_usage()
-        sys.exit(0)
+    if arg_namespace.verbose:
+        log_level = logging.DEBUG
+    else:
+        log_level = getattr(logging, arg_namespace.verbosity.upper())
 
-    if args.version:
-        print(f"websockets {websockets_version}")
-        sys.exit(0)
+    hdlr = logging.StreamHandler()
+    hdlr.setLevel(log_level)
+    hdlr.setFormatter(logging.Formatter(fmt='[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
+    wg_logger = logging.getLogger('watchfiles')
+    wg_logger.addHandler(hdlr)
+    wg_logger.setLevel(log_level)
 
-    if args.uri is None:
-        parser.print_usage()
-        sys.exit(2)
+    if arg_namespace.target_type == 'auto':
+        target_type = detect_target_type(arg_namespace.target)
+    else:
+        target_type = arg_namespace.target_type
 
-    # Enable VT100 to support ANSI escape codes in Command Prompt on Windows.
-    # See https://github.com/python/cpython/issues/74261 for why this works.
-    if sys.platform == "win32":
-        os.system("")
+    if target_type == 'function':
+        logger.debug('target_type=function, attempting import of "%s"', arg_namespace.target)
+        import_exit(arg_namespace.target)
+        if arg_namespace.args:
+            sys.argv = [arg_namespace.target] + shlex.split(arg_namespace.args)
+    elif arg_namespace.args:
+        logger.warning('--args is only used when the target is a function')
 
     try:
-        import readline  # noqa: F401
-    except ImportError:  # readline isn't available on all platforms
-        pass
+        paths = [resolve_path(p) for p in arg_namespace.paths]
+    except FileNotFoundError as e:
+        print(f'path "{e}" does not exist', file=sys.stderr)
+        sys.exit(1)
 
-    kwargs = {}
-    if args.insecure and args.uri.startswith("wss://"):
-        # This isn't a public API but it's mentioned in the changelog:
-        # https://docs.python.org/3/whatsnew/3.4.html#changed-in-3-4-3
-        kwargs["ssl"] = ssl._create_unverified_context()
+    watch_filter, watch_filter_str = build_filter(arg_namespace.filter, arg_namespace.ignore_paths)
 
-    asyncio.run(interactive_client(args.uri, **kwargs))
+    logger.info(
+        'watchfiles v%s 👀  path=%s target="%s" (%s) filter=%s...',
+        VERSION,
+        ', '.join(f'"{p}"' for p in paths),
+        arg_namespace.target,
+        target_type,
+        watch_filter_str,
+    )
+
+    run_process(
+        *paths,
+        target=arg_namespace.target,
+        target_type=target_type,
+        watch_filter=watch_filter,
+        debug=log_level == logging.DEBUG,
+        sigint_timeout=arg_namespace.sigint_timeout,
+        sigkill_timeout=arg_namespace.sigkill_timeout,
+        recursive=not arg_namespace.non_recursive,
+        ignore_permission_denied=arg_namespace.ignore_permission_denied,
+        grace_period=arg_namespace.grace_period,
+    )
+
+
+def import_exit(function_path: str) -> Any:
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.append(cwd)
+
+    try:
+        return import_string(function_path)
+    except ImportError as e:
+        print(f'ImportError: {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+def build_filter(
+    filter_name: str, ignore_paths_str: str | None
+) -> tuple[None | DefaultFilter | Callable[[Change, str], bool], str]:
+    ignore_paths: list[Path] = []
+    if ignore_paths_str:
+        ignore_paths = [Path(p).resolve() for p in ignore_paths_str.split(',')]
+
+    if filter_name == 'default':
+        return DefaultFilter(ignore_paths=ignore_paths), 'DefaultFilter'
+    elif filter_name == 'python':
+        return PythonFilter(ignore_paths=ignore_paths), 'PythonFilter'
+    elif filter_name == 'all':
+        if ignore_paths:
+            logger.warning('"--ignore-paths" argument ignored as "all" filter was selected')
+        return None, '(no filter)'
+
+    watch_filter_cls = import_exit(filter_name)
+    if isinstance(watch_filter_cls, type) and issubclass(watch_filter_cls, DefaultFilter):
+        return watch_filter_cls(ignore_paths=ignore_paths), watch_filter_cls.__name__
+
+    if ignore_paths:
+        logger.warning('"--ignore-paths" argument ignored as filter is not a subclass of DefaultFilter')
+
+    if isinstance(watch_filter_cls, type) and issubclass(watch_filter_cls, BaseFilter):
+        return watch_filter_cls(), watch_filter_cls.__name__
+    else:
+        watch_filter = cast(Callable[[Change, str], bool], watch_filter_cls)
+        return watch_filter, repr(watch_filter_cls)

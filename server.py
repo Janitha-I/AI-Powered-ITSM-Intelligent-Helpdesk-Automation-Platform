@@ -1,923 +1,356 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
-import http
+import contextlib
+import functools
 import logging
-import re
+import os
+import platform
+import random
+import signal
 import socket
-from collections.abc import Awaitable, Coroutine, Generator, Iterable, Sequence
-from types import TracebackType
-from typing import Any, Callable, Mapping, Self, cast
+import sys
+import threading
+import time
+from collections.abc import Generator, Sequence
+from email.utils import formatdate
+from types import FrameType
+from typing import TYPE_CHECKING, TypeAlias
 
-from ..exceptions import InvalidHeader
-from ..extensions.base import ServerExtensionFactory
-from ..extensions.permessage_deflate import enable_server_permessage_deflate
-from ..frames import CloseCode
-from ..headers import (
-    build_www_authenticate_basic,
-    parse_authorization_basic,
-    validate_subprotocols,
+from uvicorn._ansi import style
+from uvicorn._compat import asyncio_run
+from uvicorn.config import STARTUP_FAILURE, Config
+
+if TYPE_CHECKING:
+    from uvicorn.protocols.http.auto_zttp_impl import AutoZttpProtocol
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+    from uvicorn.protocols.http.zttp_h2_impl import ZttpH2Protocol
+    from uvicorn.protocols.http.zttp_impl import ZttpProtocol
+    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
+    from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+    from uvicorn.protocols.websockets.wsproto_impl import WSProtocol
+
+    Protocols: TypeAlias = (
+        H11Protocol
+        | HttpToolsProtocol
+        | ZttpProtocol
+        | ZttpH2Protocol
+        | AutoZttpProtocol
+        | WSProtocol
+        | WebSocketProtocol
+        | WebSocketsSansIOProtocol
+    )
+
+HANDLED_SIGNALS = (
+    signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
+    signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
 )
-from ..http11 import SERVER, Request, Response
-from ..protocol import CONNECTING, OPEN, Event
-from ..server import ServerProtocol
-from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
-from ..utils import get_socket_name
-from .connection import Connection, broadcast
+if sys.platform == "win32":  # pragma: py-not-win32
+    HANDLED_SIGNALS += (signal.SIGBREAK,)  # Windows signal 21. Sent by Ctrl+Break.
+
+logger = logging.getLogger("uvicorn.error")
 
 
-__all__ = [
-    "broadcast",
-    "serve",
-    "unix_serve",
-    "ServerConnection",
-    "Server",
-    "basic_auth",
-]
-
-
-class ServerConnection(Connection):
+class ServerState:
     """
-    :mod:`asyncio` implementation of a WebSocket server connection.
-
-    :class:`ServerConnection` provides :meth:`recv` and :meth:`send` methods for
-    receiving and sending messages.
-
-    It supports asynchronous iteration to receive messages::
-
-        async for message in websocket:
-            await process(message)
-
-    The iterator exits normally when the connection is closed with code
-    1000 (OK) or 1001 (going away) or without a close code. It raises a
-    :exc:`~websockets.exceptions.ConnectionClosedError` when the connection is
-    closed with any other code.
-
-    The ``ping_interval``, ``ping_timeout``, ``close_timeout``, ``max_queue``,
-    and ``write_limit`` arguments have the same meaning as in :func:`serve`.
-
-    Args:
-        protocol: Sans-I/O connection.
-        server: Server that manages this connection.
-
+    Shared servers state that is available between all protocol instances.
     """
 
-    def __init__(
-        self,
-        protocol: ServerProtocol,
-        server: Server,
-        *,
-        ping_interval: float | None = 20,
-        ping_timeout: float | None = 20,
-        close_timeout: float | None = 10,
-        max_queue: int | None | tuple[int | None, int | None] = 16,
-        write_limit: int | tuple[int, int | None] = 2**15,
-    ) -> None:
-        self.protocol: ServerProtocol
-        super().__init__(
-            protocol,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            close_timeout=close_timeout,
-            max_queue=max_queue,
-            write_limit=write_limit,
-        )
-        self.server = server
-        self.request_rcvd: asyncio.Future[None] = self.loop.create_future()
-        self.username: str  # see basic_auth()
-        self.handler: Callable[[ServerConnection], Awaitable[None]]  # see route()
-        self.handler_kwargs: Mapping[str, Any]  # see route()
-
-    def respond(self, status: StatusLike, text: str) -> Response:
-        """
-        Create a plain text HTTP response.
-
-        ``process_request`` and ``process_response`` may call this method to
-        return an HTTP response instead of performing the WebSocket opening
-        handshake.
-
-        You can modify the response before returning it, for example by changing
-        HTTP headers.
-
-        Args:
-            status: HTTP status code.
-            text: HTTP response body; it will be encoded to UTF-8.
-
-        Returns:
-            HTTP response to send to the client.
-
-        """
-        return self.protocol.reject(status, text)
-
-    async def handshake(
-        self,
-        process_request: (
-            Callable[
-                [ServerConnection, Request],
-                Awaitable[Response | None] | Response | None,
-            ]
-            | None
-        ) = None,
-        process_response: (
-            Callable[
-                [ServerConnection, Request, Response],
-                Awaitable[Response | None] | Response | None,
-            ]
-            | None
-        ) = None,
-        server_header: str | None = SERVER,
-    ) -> None:
-        """
-        Perform the opening handshake.
-
-        """
-        await asyncio.wait(
-            [self.request_rcvd, self.connection_lost_waiter],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if self.request is not None:
-            response = None
-
-            if process_request is not None:
-                try:
-                    response = process_request(self, self.request)
-                    if isinstance(response, Awaitable):
-                        response = await response
-                except Exception as exc:
-                    self.protocol.handshake_exc = exc
-                    self.logger.error("process_request failed", exc_info=True)
-                    response = self.protocol.reject(
-                        http.HTTPStatus.INTERNAL_SERVER_ERROR,
-                        (
-                            "Failed to open a WebSocket connection.\n"
-                            "See server log for more information.\n"
-                        ),
-                    )
-
-            if response is None:
-                self.response = self.protocol.accept(self.request)
-            else:
-                assert isinstance(response, Response)  # help mypy
-                self.response = response
-
-            if server_header is not None:
-                self.response.headers["Server"] = server_header
-
-            response = None
-
-            if process_response is not None:
-                try:
-                    response = process_response(self, self.request, self.response)
-                    if isinstance(response, Awaitable):
-                        response = await response
-                except Exception as exc:
-                    self.protocol.handshake_exc = exc
-                    self.logger.error("process_response failed", exc_info=True)
-                    response = self.protocol.reject(
-                        http.HTTPStatus.INTERNAL_SERVER_ERROR,
-                        (
-                            "Failed to open a WebSocket connection.\n"
-                            "See server log for more information.\n"
-                        ),
-                    )
-
-            if response is not None:
-                assert isinstance(response, Response)  # help mypy
-                self.response = response
-
-            # Reject the connection if the server started closing during the
-            # opening handshake. Don't yield before send_response() to avoid
-            # a race condition after checking if the server is closing.
-            if (
-                self.response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS
-                and not self.server.is_serving()
-            ):
-                self.response = self.protocol.reject(
-                    http.HTTPStatus.SERVICE_UNAVAILABLE,
-                    "Server is shutting down.\n",
-                )
-
-            # Don't respond if the connection was closed during the handshake.
-            if self.state is CONNECTING:
-                async with self.send_context(expected_state=CONNECTING):
-                    self.protocol.send_response(self.response)
-
-    def process_event(self, event: Event) -> None:
-        """
-        Process one incoming event.
-
-        """
-        # First event - handshake request.
-        if self.request is None:
-            assert isinstance(event, Request)
-            self.request = event
-            self.request_rcvd.set_result(None)
-        # Later events - frames.
-        else:
-            super().process_event(event)
-
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        super().connection_made(transport)
-        # The handler task must be registered in self.handler_tasks now. If it
-        # was registered inside the task, a race condition could happen when
-        # closing the server after scheduling the task but before it executes.
-        handler_task = self.loop.create_task(self.server.handler(self))
-        self.server.handler_tasks.add(handler_task)
+    def __init__(self) -> None:
+        self.total_requests = 0
+        self.connections: set[Protocols] = set()
+        self.tasks: set[asyncio.Task[None]] = set()
+        self.default_headers: list[tuple[bytes, bytes]] = []
 
 
 class Server:
-    """
-    WebSocket server returned by :func:`serve`.
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.server_state = ServerState()
 
-    This class mirrors most of the API of :class:`asyncio.Server`, with the
-    following differences:
+        self.started = False
+        self.should_exit = False
+        self.force_exit = False
+        self.last_notified = 0.0
 
-    * You can invoke :func:`serve` as ``async with serve(...) as server: ...``
-      in addition to ``server = await serve(...)`` to start the server.
+        self._captured_signals: list[int] = []
 
-    * It doesn't provide ``close_clients`` or ``abort_clients``; by default,
-      :meth:`close` closes existing connections with code 1001 (going away).
+    @functools.cached_property
+    def limit_max_requests(self) -> int | None:
+        if self.config.limit_max_requests is None:
+            return None
+        return self.config.limit_max_requests + random.randint(0, self.config.limit_max_requests_jitter)
 
-    Args:
-        handler: Handler for one connection. It receives an asyncio protocol.
-        logger: Logger for this server.
-            It defaults to ``logging.getLogger("websockets.server")``.
-            See the :doc:`logging guide <../../topics/logging>` for details.
+    def run(self, sockets: list[socket.socket] | None = None) -> None:
+        return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
 
-    """
+    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+        with self.capture_signals():
+            await self._serve(sockets)
 
-    def __init__(
-        self,
-        create_server: Callable[[], Coroutine[Any, Any, asyncio.Server]],
-        handler: Callable[[ServerConnection], Coroutine[Any, Any, None]],
-        logger: LoggerLike | None = None,
-    ) -> None:
-        self.create_server = create_server
-        self.handler = handler
-        if logger is None:
-            logger = logging.getLogger("websockets.server")
-        self.logger = logger
+    async def _serve(self, sockets: list[socket.socket] | None = None) -> None:
+        process_id = os.getpid()
 
-        # Keep track of active connections and connection handler tasks.
-        self.all_connections: set[ServerConnection] = set()
-        self.handler_tasks: set[asyncio.Task[None]] = set()
+        config = self.config
+        if not config.loaded:
+            config.load()
 
-        # Task responsible for closing the server and terminating connections.
-        self.close_task: asyncio.Task[None] | None = None
+        self.lifespan = config.lifespan_class(config)
 
-        # Completed when the server is closed and connections are terminated.
-        loop = asyncio.get_running_loop()
-        self.handlers_waiter: asyncio.Future[None] = loop.create_future()
+        message = "Started server process [%d]"
+        color_message = "Started server process [" + style("%d", fg="cyan") + "]"
+        logger.info(message, process_id, extra={"color_message": color_message})
 
-    @property
-    def connections(self) -> set[ServerConnection]:
-        """
-        Set of active connections.
+        await self.startup(sockets=sockets)
+        if not self.should_exit:
+            await self.main_loop()
+        if self.started:
+            await self.shutdown(sockets=sockets)
 
-        This property contains all connections that completed the opening
-        handshake successfully and didn't start the closing handshake yet.
-        It can be useful in combination with :func:`~broadcast`.
+            message = "Finished server process [%d]"
+            color_message = "Finished server process [" + style("%d", fg="cyan") + "]"
+            logger.info(message, process_id, extra={"color_message": color_message})
 
-        """
-        return {
-            connection
-            for connection in self.all_connections
-            if connection.protocol.state is OPEN
-        }
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await self.lifespan.startup()
+        if self.lifespan.should_exit:
+            sys.exit(STARTUP_FAILURE)
 
-    def close(
-        self,
-        close_connections: bool = True,
-        code: CloseCode | int = CloseCode.GOING_AWAY,
-        reason: str = "",
-    ) -> None:
-        """
-        Close the server.
+        config = self.config
 
-        * Close the underlying :class:`asyncio.Server`.
-        * When ``close_connections`` is :obj:`True`, which is the default, close
-          existing connections. Specifically:
-
-          * Reject opening WebSocket connections with an HTTP 503 (service
-            unavailable) error. This happens when the server accepted the TCP
-            connection but didn't complete the opening handshake before closing.
-          * Close open WebSocket connections with code 1001 (going away).
-            ``code`` and ``reason`` can be customized, for example to use code
-            1012 (service restart).
-
-        * Wait until all connection handlers have returned.
-
-        :meth:`close` is idempotent.
-
-        """
-        if self.close_task is None:
-            self.close_task = self.get_loop().create_task(
-                self._close(close_connections, code, reason)
+        def create_protocol(
+            _loop: asyncio.AbstractEventLoop | None = None,
+        ) -> asyncio.Protocol:
+            return config.http_protocol_class(  # type: ignore[call-arg]
+                config=config,
+                server_state=self.server_state,
+                app_state=self.lifespan.state,
+                _loop=_loop,
             )
 
-    async def _close(
-        self,
-        close_connections: bool = True,
-        code: CloseCode | int = CloseCode.GOING_AWAY,
-        reason: str = "",
-    ) -> None:
-        """
-        Implementation of :meth:`close`.
+        loop = asyncio.get_running_loop()
 
-        This calls :meth:`~asyncio.Server.close` on the underlying
-        :class:`asyncio.Server` object to stop accepting new connections and
-        then closes open connections.
+        listeners: Sequence[socket.SocketType]
+        if sockets is not None:  # pragma: full coverage
+            # Explicitly passed a list of open sockets.
+            # We use this when the server is run from a Gunicorn worker.
 
-        """
-        self.logger.info("server closing")
+            def _share_socket(
+                sock: socket.SocketType,
+            ) -> socket.SocketType:  # pragma py-not-win32
+                # Windows requires the socket be explicitly shared across
+                # multiple workers (processes).
+                from socket import fromshare  # type: ignore[attr-defined]
+
+                sock_data = sock.share(os.getpid())  # type: ignore[attr-defined]
+                return fromshare(sock_data)
+
+            self.servers: list[asyncio.base_events.Server] = []
+            for sock in sockets:
+                is_windows = platform.system() == "Windows"
+                if config.workers > 1 and is_windows:  # pragma: py-not-win32
+                    sock = _share_socket(sock)  # type: ignore[assignment]
+                server = await loop.create_server(create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog)
+                self.servers.append(server)
+            listeners = sockets
+
+        elif config.fd is not None:  # pragma: py-win32
+            # Use an existing socket, from a file descriptor.
+            sock = socket.fromfd(config.fd, socket.AF_UNIX, socket.SOCK_STREAM)
+            server = await loop.create_server(create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog)
+            assert server.sockets is not None  # mypy
+            listeners = server.sockets
+            self.servers = [server]
+
+        elif config.uds is not None:  # pragma: py-win32
+            # Create a socket using UNIX domain socket.
+            uds_perms = 0o666
+            if os.path.exists(config.uds):
+                uds_perms = os.stat(config.uds).st_mode  # pragma: full coverage
+            server = await loop.create_unix_server(
+                create_protocol, path=config.uds, ssl=config.ssl, backlog=config.backlog
+            )
+            os.chmod(config.uds, uds_perms)
+            assert server.sockets is not None  # mypy
+            listeners = server.sockets
+            self.servers = [server]
+
+        else:
+            # Standard case. Create a socket from a host/port pair.
+            try:
+                server = await loop.create_server(
+                    create_protocol,
+                    host=config.host,
+                    port=config.port,
+                    ssl=config.ssl,
+                    backlog=config.backlog,
+                )
+            except OSError as exc:
+                logger.error(exc)
+                await self.lifespan.shutdown()
+                sys.exit(STARTUP_FAILURE)
+
+            assert server.sockets is not None
+            listeners = server.sockets
+            self.servers = [server]
+
+        if sockets is None:
+            self._log_started_message(listeners)
+        else:
+            # We're most likely running multiple workers, so a message has already been
+            # logged by `config.bind_socket()`.
+            pass  # pragma: full coverage
+
+        self.started = True
+
+    def _log_started_message(self, listeners: Sequence[socket.SocketType]) -> None:
+        config = self.config
+
+        if config.fd is not None:  # pragma: py-win32
+            sock = listeners[0]
+            logger.info(
+                "Uvicorn running on socket %s (Press CTRL+C to quit)",
+                sock.getsockname(),
+            )
+
+        elif config.uds is not None:  # pragma: py-win32
+            logger.info("Uvicorn running on unix socket %s (Press CTRL+C to quit)", config.uds)
+
+        else:
+            addr_format = "%s://%s:%d"
+            host = "0.0.0.0" if config.host is None else config.host
+            if ":" in host:
+                # It's an IPv6 address.
+                addr_format = "%s://[%s]:%d"
+
+            port = config.port
+            if port == 0:
+                port = listeners[0].getsockname()[1]
+
+            protocol_name = "https" if config.ssl else "http"
+            message = f"Uvicorn running on {addr_format} (Press CTRL+C to quit)"
+            color_message = "Uvicorn running on " + style(addr_format, bold=True) + " (Press CTRL+C to quit)"
+            logger.info(
+                message,
+                protocol_name,
+                host,
+                port,
+                extra={"color_message": color_message},
+            )
+
+    async def main_loop(self) -> None:
+        counter = 0
+        should_exit = await self.on_tick(counter)
+        while not should_exit:
+            counter += 1
+            counter = counter % 864000
+            await asyncio.sleep(0.1)
+            should_exit = await self.on_tick(counter)
+
+    async def on_tick(self, counter: int) -> bool:
+        # Update the default headers, once per second.
+        if counter % 10 == 0:
+            current_time = time.time()
+            current_date = formatdate(current_time, usegmt=True).encode()
+
+            if self.config.date_header:
+                date_header = [(b"date", current_date)]
+            else:
+                date_header = []
+
+            self.server_state.default_headers = date_header + self.config.encoded_headers
+
+            # Callback to `callback_notify` once every `timeout_notify` seconds.
+            if self.config.callback_notify is not None:
+                if current_time - self.last_notified > self.config.timeout_notify:  # pragma: full coverage
+                    self.last_notified = current_time
+                    await self.config.callback_notify()
+
+        # Determine if we should exit.
+        if self.should_exit:
+            return True
+
+        max_requests = self.limit_max_requests
+        if max_requests is not None and self.server_state.total_requests >= max_requests:
+            logger.info("Maximum request limit of %d exceeded. Terminating process.", max_requests)
+            return True
+
+        return False
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        logger.info("Shutting down")
 
         # Stop accepting new connections.
-        # Also reject OPENING connections with HTTP 503 — see handshake().
-        self.server.close()
-
-        # Close OPEN connections.
-        if close_connections:
-            close_tasks = [
-                asyncio.create_task(connection.close(code, reason))
-                for connection in self.all_connections
-                if connection.protocol.state is OPEN
-            ]
-            # asyncio.wait doesn't accept an empty first argument.
-            if close_tasks:
-                await asyncio.wait(close_tasks)
-
-        # Wait until all TCP connections are closed.
-        await self.server.wait_closed()
-
-        # Wait until all connection handlers have returned.
-        # asyncio.wait doesn't accept an empty first argument.
-        if self.handler_tasks:
-            await asyncio.wait(self.handler_tasks)
-
-        # Tell wait_closed() to return.
-        self.handlers_waiter.set_result(None)
-
-        self.logger.info("server closed")
-
-    def get_loop(self) -> asyncio.AbstractEventLoop:
-        """
-        See :meth:`asyncio.Server.get_loop`.
-
-        """
-        return self.server.get_loop()
-
-    async def start_serving(self) -> None:
-        """
-        See :meth:`asyncio.Server.start_serving`.
-
-        Typical use::
-
-            server = await serve(..., start_serving=False)
-            # perform additional setup here...
-            # ... then start the server
-            await server.start_serving()
-
-        """
-        await self.server.start_serving()
-
-    async def serve_forever(self) -> None:
-        """
-        See :meth:`asyncio.Server.serve_forever`.
-
-        Typical use::
-
-            server = await serve(...)
-            # this coroutine doesn't return
-            # canceling it stops the server
-            await server.serve_forever()
-
-        This is an alternative to using :func:`serve` as an asynchronous context
-        manager. Shutdown is triggered by canceling :meth:`serve_forever` or by
-        calling :meth:`~Server.close` from another task.
-
-        """
-        try:
-            if not self.is_serving():
-                await self.start_serving()
-            # If close() is called, wait_closed() will return, and we'll exit.
-            await self.wait_closed()
-        except asyncio.CancelledError:
-            try:
-                self.close()
-                await self.wait_closed()
-            finally:
-                raise
-
-    def is_serving(self) -> bool:
-        """
-        See :meth:`asyncio.Server.is_serving`.
-
-        """
-        return self.server.is_serving()
-
-    async def wait_closed(self) -> None:
-        """
-        Wait until the server is closed.
-
-        When :meth:`wait_closed` returns, all TCP connections are closed and
-        all connection handlers have returned.
-
-        To ensure a fast shutdown, a connection handler should always be
-        awaiting at least one of:
-
-        * :meth:`~ServerConnection.recv`: when the connection is closed,
-          it raises :exc:`~websockets.exceptions.ConnectionClosedOK`;
-        * :meth:`~ServerConnection.wait_closed`: when the connection is
-          closed, it returns.
-
-        Then the connection handler is immediately notified of the shutdown;
-        it can clean up and exit.
-
-        """
-        await asyncio.shield(self.handlers_waiter)
-
-    @property
-    def sockets(self) -> tuple[socket.socket, ...]:
-        """
-        See :attr:`asyncio.Server.sockets`.
-
-        """
-        return self.server.sockets
-
-    async def _await(self) -> Self:
-        if not hasattr(self, "server"):
-            self.server = await self.create_server()
-            if self.server.is_serving():
-                for sock in self.server.sockets:
-                    self.logger.info("server listening on %s", get_socket_name(sock))
-        return self
-
-    def __await__(self) -> Generator[Any, None, Self]:
-        # Create a suitable iterator by calling __await__ on a coroutine.
-        return self._await().__await__()
-
-    async def __aenter__(self) -> Self:
-        return await self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        self.close()
-        await self.wait_closed()
-
-
-# serve() is declared as a function rather than a coroutine in order to support
-# async with serve(...) as server: ... in addition to server = await serve(...).
-
-
-def serve(
-    handler: Callable[[ServerConnection], Awaitable[None]],
-    host: str | None = None,
-    port: int | None = None,
-    *,
-    # WebSocket
-    origins: Sequence[Origin | re.Pattern[str] | None] | None = None,
-    extensions: Sequence[ServerExtensionFactory] | None = None,
-    subprotocols: Sequence[Subprotocol] | None = None,
-    select_subprotocol: (
-        Callable[
-            [ServerConnection, Sequence[Subprotocol]],
-            Subprotocol | None,
-        ]
-        | None
-    ) = None,
-    compression: str | None = "deflate",
-    # HTTP
-    process_request: (
-        Callable[
-            [ServerConnection, Request],
-            Awaitable[Response | None] | Response | None,
-        ]
-        | None
-    ) = None,
-    process_response: (
-        Callable[
-            [ServerConnection, Request, Response],
-            Awaitable[Response | None] | Response | None,
-        ]
-        | None
-    ) = None,
-    server_header: str | None = SERVER,
-    # Timeouts
-    open_timeout: float | None = 10,
-    ping_interval: float | None = 20,
-    ping_timeout: float | None = 20,
-    close_timeout: float | None = 10,
-    # Limits
-    max_size: int | None | tuple[int | None, int | None] = 2**20,
-    max_queue: int | None | tuple[int | None, int | None] = 16,
-    write_limit: int | tuple[int, int | None] = 2**15,
-    # Logging
-    logger: LoggerLike | None = None,
-    # Escape hatch for advanced customization
-    create_connection: type[ServerConnection] | None = None,
-    # Other keyword arguments are passed to loop.create_server
-    **kwargs: Any,
-) -> Server:
-    """
-    Create a WebSocket server listening on ``host`` and ``port``.
-
-    Whenever a client connects, the server creates a :class:`ServerConnection`,
-    performs the opening handshake, and delegates to the ``handler`` coroutine.
-
-    The handler receives the :class:`ServerConnection` instance, which you can
-    use to send and receive messages.
-
-    Once the handler completes, either normally or with an exception, the server
-    performs the closing handshake and closes the connection.
-
-    This function returns a :class:`Server` object whose API mirrors
-    :class:`asyncio.Server`. Treat it as an asynchronous context manager to
-    serve requests and ensure that the server will be closed gracefully::
-
-        from websockets.asyncio.server import serve
-
-        async def handler(websocket):
-            ...
-
-        # set this event to exit the server
-        stop = asyncio.Event()
-
-        async with serve(handler, host, port):
-            await stop.wait()
-
-    Alternatively, await it and call :meth:`~Server.serve_forever` to serve
-    requests, then cancel it to stop the server::
-
-        server = await serve(handler, host, port)
-        await server.serve_forever()
-
-    Combining these two patterns works, but is unnecessary: when the context
-    manager exits, :meth:`~Server.serve_forever` has already closed the server::
-
-        async with serve(handler, host, port) as server:  # don't do this!
-            await server.serve_forever()                  # it's redundant
-
-    You can also stop the server gracefully by calling its
-    :meth:`~Server.close` method::
-
-        server = await serve(handler, host, port)
-        try:
-            await stop.wait()
-        finally:
+        for server in self.servers:
             server.close()
+        for sock in sockets or []:
+            sock.close()  # pragma: full coverage
+
+        # Request shutdown on all existing connections.
+        for connection in list(self.server_state.connections):
+            connection.shutdown()
+        await asyncio.sleep(0.1)
+
+        # When 3.10 is not supported anymore, use `async with asyncio.timeout(...):`.
+        try:
+            await asyncio.wait_for(
+                self._wait_tasks_to_complete(),
+                timeout=self.config.timeout_graceful_shutdown,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Cancel %s running task(s), timeout graceful shutdown exceeded",
+                len(self.server_state.tasks),
+            )
+            for t in self.server_state.tasks:
+                t.cancel(msg="Task cancelled, timeout graceful shutdown exceeded")
+
+        # Send the lifespan shutdown event, and wait for application shutdown.
+        if not self.force_exit:
+            await self.lifespan.shutdown()
+
+    async def _wait_tasks_to_complete(self) -> None:
+        # Wait for existing connections to finish sending responses.
+        if self.server_state.connections and not self.force_exit:
+            msg = "Waiting for connections to close. (CTRL+C to force quit)"
+            logger.info(msg)
+            while self.server_state.connections and not self.force_exit:
+                await asyncio.sleep(0.1)
+
+        # Wait for existing tasks to complete.
+        if self.server_state.tasks and not self.force_exit:
+            msg = "Waiting for background tasks to complete. (CTRL+C to force quit)"
+            logger.info(msg)
+            while self.server_state.tasks and not self.force_exit:
+                await asyncio.sleep(0.1)
+
+        for server in self.servers:
             await server.wait_closed()
 
-    By default, closing the server closes connections with code 1001 (going
-    away). You can keep connections alive and wait for clients to disconnect::
-
-        server.close(close_connections=False)
-
-    Args:
-        handler: Connection handler. It receives the WebSocket connection,
-            which is a :class:`ServerConnection`, in argument.
-        host: Network interfaces the server binds to.
-            See :meth:`~asyncio.loop.create_server` for details.
-        port: TCP port the server listens on.
-            See :meth:`~asyncio.loop.create_server` for details.
-        origins: Acceptable values of the ``Origin`` header, for defending
-            against Cross-Site WebSocket Hijacking attacks. Values can be
-            :class:`str` to test for an exact match or regular expressions
-            compiled by :func:`re.compile` to test against a pattern. Include
-            :obj:`None` in the list if the lack of an origin is acceptable.
-        extensions: List of supported extensions, in order in which they
-            should be negotiated and run.
-        subprotocols: List of supported subprotocols, in order of decreasing
-            preference.
-        select_subprotocol: Callback for selecting a subprotocol among
-            those supported by the client and the server. It receives a
-            :class:`ServerConnection` (not a
-            :class:`~websockets.server.ServerProtocol`!) instance and a list of
-            subprotocols offered by the client. Other than the first argument,
-            it has the same behavior as the
-            :meth:`ServerProtocol.select_subprotocol
-            <websockets.server.ServerProtocol.select_subprotocol>` method.
-        compression: The "permessage-deflate" extension is enabled by default.
-            Set ``compression`` to :obj:`None` to disable it. See the
-            :doc:`compression guide <../../topics/compression>` for details.
-        process_request: Intercept the request during the opening handshake.
-            Return an HTTP response to force the response or :obj:`None` to
-            continue normally. When you force an HTTP 101 Continue response, the
-            handshake is successful. Else, the connection is aborted.
-            ``process_request`` may be a function or a coroutine.
-        process_response: Intercept the response during the opening handshake.
-            Return an HTTP response to force the response or :obj:`None` to
-            continue normally. When you force an HTTP 101 Continue response, the
-            handshake is successful. Else, the connection is aborted.
-            ``process_response`` may be a function or a coroutine.
-        server_header: Value of  the ``Server`` response header.
-            It defaults to ``"Python/x.y.z websockets/X.Y"``. Setting it to
-            :obj:`None` removes the header.
-        open_timeout: Timeout for opening connections in seconds.
-            :obj:`None` disables the timeout.
-        ping_interval: Interval between keepalive pings in seconds.
-            :obj:`None` disables keepalive.
-        ping_timeout: Timeout for keepalive pings in seconds.
-            :obj:`None` disables timeouts.
-        close_timeout: Timeout for closing connections in seconds.
-            :obj:`None` disables the timeout.
-        max_size: Maximum size of incoming messages in bytes.
-            :obj:`None` disables the limit. You may pass a ``(max_message_size,
-            max_fragment_size)`` tuple to set different limits for messages and
-            fragments when you expect long messages sent in short fragments.
-        max_queue: High-water mark of the buffer where frames are received.
-            It defaults to 16 frames. The low-water mark defaults to ``max_queue
-            // 4``. You may pass a ``(high, low)`` tuple to set the high-water
-            and low-water marks. If you want to disable flow control entirely,
-            you may set it to ``None``, although that's a bad idea.
-        write_limit: High-water mark of write buffer in bytes. It is passed to
-            :meth:`~asyncio.WriteTransport.set_write_buffer_limits`. It defaults
-            to 32 KiB. You may pass a ``(high, low)`` tuple to set the
-            high-water and low-water marks.
-        logger: Logger for this server.
-            It defaults to ``logging.getLogger("websockets.server")``.
-            See the :doc:`logging guide <../../topics/logging>` for details.
-        create_connection: Factory for the :class:`ServerConnection` managing
-            the connection. Set it to a wrapper or a subclass to customize
-            connection handling.
-
-    Any other keyword arguments are passed to the event loop's
-    :meth:`~asyncio.loop.create_server` method.
-
-    For example:
-
-    * You can set ``ssl`` to a :class:`~ssl.SSLContext` to enable TLS.
-
-    * You can set ``sock`` to provide a preexisting TCP socket. You may call
-      :func:`socket.create_server` (not to be confused with the event loop's
-      :meth:`~asyncio.loop.create_server` method) to create a suitable server
-      socket and customize it.
-
-    * You can set ``start_serving`` to ``False`` to start accepting connections
-      only after you call :meth:`~Server.start_serving()` or
-      :meth:`~Server.serve_forever()`.
-
-    """
-    if subprotocols is not None:
-        validate_subprotocols(subprotocols)
-
-    if compression == "deflate":
-        extensions = enable_server_permessage_deflate(extensions)
-    elif compression is not None:
-        raise ValueError(f"unsupported compression: {compression}")
-
-    if create_connection is None:
-        create_connection = ServerConnection
-
-    if kwargs.get("ssl") is not None:
-        kwargs.setdefault("ssl_handshake_timeout", open_timeout)
-        kwargs.setdefault("ssl_shutdown_timeout", close_timeout)
-
-    async def create_server() -> asyncio.Server:
-        loop = asyncio.get_running_loop()
-        if kwargs.pop("unix", False):
-            return await loop.create_unix_server(protocol_factory, **kwargs)
-        else:
-            return await loop.create_server(protocol_factory, host, port, **kwargs)
-
-    def protocol_factory() -> ServerConnection:
-        """
-        Create an asyncio protocol for managing a WebSocket connection.
-
-        """
-        # Create a closure to give select_subprotocol access to connection.
-        protocol_select_subprotocol: (
-            Callable[
-                [ServerProtocol, Sequence[Subprotocol]],
-                Subprotocol | None,
-            ]
-            | None
-        ) = None
-        if select_subprotocol is not None:
-
-            def protocol_select_subprotocol(
-                protocol: ServerProtocol,
-                subprotocols: Sequence[Subprotocol],
-            ) -> Subprotocol | None:
-                # mypy doesn't know that select_subprotocol is immutable.
-                assert select_subprotocol is not None
-                # Ensure this function is only used in the intended context.
-                assert protocol is connection.protocol
-                return select_subprotocol(connection, subprotocols)
-
-        # This is a protocol in the Sans-I/O implementation of websockets.
-        protocol = ServerProtocol(
-            origins=origins,
-            extensions=extensions,
-            subprotocols=subprotocols,
-            select_subprotocol=protocol_select_subprotocol,
-            max_size=max_size,
-            logger=logger,
-        )
-        # This is a connection in websockets and a protocol in asyncio.
-        connection = create_connection(
-            protocol,
-            server,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            close_timeout=close_timeout,
-            max_queue=max_queue,
-            write_limit=write_limit,
-        )
-        return connection
-
-    async def protocol_handler(connection: ServerConnection) -> None:
-        """
-        Handle the lifecycle of a WebSocket connection.
-
-        Since this coroutine doesn't have a caller that can handle
-        exceptions, it attempts to log relevant ones.
-
-        It guarantees that the TCP connection is closed before exiting.
-
-        """
+    @contextlib.contextmanager
+    def capture_signals(self) -> Generator[None, None, None]:
+        # Signals can only be listened to from the main thread.
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        # always use signal.signal, even if loop.add_signal_handler is available
+        # this allows to restore previous signal handlers later on
+        original_handlers = {sig: signal.signal(sig, self.handle_exit) for sig in HANDLED_SIGNALS}
         try:
-            # Apply open_timeout to the WebSocket handshake.
-            # Use ssl_handshake_timeout for the TLS handshake.
-            async with asyncio.timeout(open_timeout):
-                await connection.handshake(
-                    process_request,
-                    process_response,
-                    server_header,
-                )
-
-            if connection.protocol.state is not OPEN:
-                connection.transport.abort()
-                return
-
-            server.all_connections.add(connection)
-            connection.start_keepalive()
-            try:
-                async with connection:
-                    await handler(connection)
-            except Exception:
-                connection.logger.error("connection handler failed", exc_info=True)
-            finally:
-                server.all_connections.discard(connection)
-
-        except Exception:
-            # Don't leak connections when the opening handshake times out or
-            # an unexpected error occurs.
-            connection.transport.abort()
-
+            yield
         finally:
-            server.handler_tasks.discard(asyncio.current_task())
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+        # If we did gracefully shut down due to a signal, try to
+        # trigger the expected behaviour now; multiple signals would be
+        # done LIFO, see https://stackoverflow.com/questions/48434964
+        for captured_signal in reversed(self._captured_signals):
+            signal.raise_signal(captured_signal)
 
-    # The server variable is captured by the closure of conn_handler() and
-    # protocol_factory().
-    server = Server(create_server, protocol_handler, logger)
-    return server
-
-
-def unix_serve(
-    handler: Callable[[ServerConnection], Awaitable[None]],
-    path: PathLike | None = None,
-    **kwargs: Any,
-) -> Server:
-    """
-    Create a WebSocket server listening on a Unix socket.
-
-    This function is identical to :func:`serve`, except the ``host`` and
-    ``port`` arguments are replaced by ``path``. It's only available on Unix.
-
-    It's useful for deploying a server behind a reverse proxy such as nginx.
-
-    Args:
-        handler: Connection handler. It receives the WebSocket connection,
-            which is a :class:`ServerConnection`, in argument.
-        path: File system path to the Unix socket.
-
-    """
-    return serve(handler, unix=True, path=path, **kwargs)
-
-
-def is_credentials(credentials: Any) -> bool:
-    try:
-        username, password = credentials
-    except (TypeError, ValueError):
-        return False
-    else:
-        return isinstance(username, str) and isinstance(password, str)
-
-
-def basic_auth(
-    realm: str = "",
-    credentials: tuple[str, str] | Iterable[tuple[str, str]] | None = None,
-    check_credentials: Callable[[str, str], Awaitable[bool] | bool] | None = None,
-) -> Callable[[ServerConnection, Request], Awaitable[Response | None]]:
-    """
-    Factory for ``process_request`` to enforce HTTP Basic Authentication.
-
-    :func:`basic_auth` is designed to integrate with :func:`serve` as follows::
-
-        from websockets.asyncio.server import basic_auth, serve
-
-        async with serve(
-            ...,
-            process_request=basic_auth(
-                realm="my dev server",
-                credentials=("hello", "iloveyou"),
-            ),
-        ):
-
-    If authentication succeeds, the connection's ``username`` attribute is set.
-    If it fails, the server responds with an HTTP 401 Unauthorized status.
-
-    One of ``credentials`` or ``check_credentials`` must be provided; not both.
-
-    Args:
-        realm: Scope of protection. It should contain only ASCII characters
-            because the encoding of non-ASCII characters is undefined. Refer to
-            section 2.2 of :rfc:`7235` for details.
-        credentials: Hard coded authorized credentials. It can be a
-            ``(username, password)`` pair or a list of such pairs.
-        check_credentials: Function or coroutine that verifies credentials.
-            It receives ``username`` and ``password`` arguments and returns
-            whether they're valid.
-    Raises:
-        TypeError: If ``credentials`` or ``check_credentials`` is wrong.
-        ValueError: If ``credentials`` and ``check_credentials`` are both
-            provided or both not provided.
-
-    """
-    if (credentials is None) == (check_credentials is None):
-        raise ValueError("provide either credentials or check_credentials")
-
-    if credentials is not None:
-        if is_credentials(credentials):
-            credentials_list = [cast(tuple[str, str], credentials)]
-        elif isinstance(credentials, Iterable):
-            credentials_list = list(cast(Iterable[tuple[str, str]], credentials))
-            if not all(is_credentials(item) for item in credentials_list):
-                raise TypeError(f"invalid credentials argument: {credentials}")
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        self._captured_signals.append(sig)
+        if self.should_exit and sig == signal.SIGINT:
+            self.force_exit = True  # pragma: full coverage
         else:
-            raise TypeError(f"invalid credentials argument: {credentials}")
-
-        credentials_dict = dict(credentials_list)
-
-        def check_credentials(username: str, password: str) -> bool:
-            try:
-                expected_password = credentials_dict[username]
-            except KeyError:
-                return False
-            return hmac.compare_digest(expected_password, password)
-
-    assert check_credentials is not None  # help mypy
-
-    async def process_request(
-        connection: ServerConnection,
-        request: Request,
-    ) -> Response | None:
-        """
-        Perform HTTP Basic Authentication.
-
-        If it succeeds, set the connection's ``username`` attribute and return
-        :obj:`None`. If it fails, return an HTTP 401 Unauthorized responss.
-
-        """
-        try:
-            authorization = request.headers["Authorization"]
-        except KeyError:
-            response = connection.respond(
-                http.HTTPStatus.UNAUTHORIZED,
-                "Missing credentials\n",
-            )
-            response.headers["WWW-Authenticate"] = build_www_authenticate_basic(realm)
-            return response
-
-        try:
-            username, password = parse_authorization_basic(authorization)
-        except InvalidHeader:
-            response = connection.respond(
-                http.HTTPStatus.UNAUTHORIZED,
-                "Unsupported credentials\n",
-            )
-            response.headers["WWW-Authenticate"] = build_www_authenticate_basic(realm)
-            return response
-
-        valid_credentials = check_credentials(username, password)
-        if isinstance(valid_credentials, Awaitable):
-            valid_credentials = await valid_credentials
-
-        if not valid_credentials:
-            response = connection.respond(
-                http.HTTPStatus.UNAUTHORIZED,
-                "Invalid credentials\n",
-            )
-            response.headers["WWW-Authenticate"] = build_www_authenticate_basic(realm)
-            return response
-
-        connection.username = username
-        return None
-
-    return process_request
+            self.should_exit = True
